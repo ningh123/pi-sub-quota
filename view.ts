@@ -135,10 +135,15 @@ export function formatQuota(snapshot: QuotaSnapshot, now: number, opts?: { stale
  * balance is money, so nothing is rounded. With `detail` and a granted part
  * of at least one cent, topped-up and granted amounts sit side by side,
  * each with its currency symbol ("¥18.67+¥1.00") so multi-currency accounts
- * stay readable; otherwise the exact total ("¥19.67").
+ * stay readable; otherwise the exact total ("¥19.67"). A depleting wallet
+ * with a known top-up shows both amounts in every mode ("¥5.00/¥20.00"),
+ * since the remaining money only reads against what was paid in.
  */
 export function formatBalanceCompact(balance: QuotaBalance, opts?: { detail?: boolean }): string {
 	const cents = (value: number) => value.toFixed(2);
+	if (balance.toppedUp !== undefined) {
+		return `${balance.symbol}${cents(balance.total)}/${balance.symbol}${cents(balance.toppedUp)}`;
+	}
 	if (!opts?.detail || balance.granted < 0.01) return `${balance.symbol}${cents(balance.total)}`;
 	return `${balance.symbol}${cents(balance.total - balance.granted)}+${balance.symbol}${cents(balance.granted)}`;
 }
@@ -264,12 +269,18 @@ export interface QuotaPanelRow {
 	note?: string;
 }
 
-/** Exact balance for the panel header: "¥19.67 + ¥1.00 granted" or "¥19.67". */
+/**
+ * Exact balance for the panel header: "¥19.67 + ¥1.00 granted", "¥19.67",
+ * or "booster ¥5.00/¥20.00" for a depleting wallet (its label tells the
+ * two apart from a plain prepaid balance).
+ */
 function formatBalancePanel(balance: QuotaBalance): string {
+	const label = balance.label ? `${balance.label} ` : "";
 	// Same one-cent threshold as formatBalanceCompact, so footer and panel
 	// always agree on whether a granted part is shown at all.
+	if (balance.toppedUp !== undefined) return `${label}${formatBalanceCompact(balance)}`;
 	const granted = balance.granted >= 0.01 ? ` + ${balance.symbol}${balance.granted.toFixed(2)} granted` : "";
-	return `${balance.symbol}${balance.total.toFixed(2)}${granted}`;
+	return `${label}${balance.symbol}${balance.total.toFixed(2)}${granted}`;
 }
 
 /**

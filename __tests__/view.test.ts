@@ -174,6 +174,14 @@ describe("formatBalanceCompact", () => {
 		// No granted part at all: a single number in any currency.
 		assert.equal(formatBalanceCompact({ type: "balance", symbol: "$", total: 2.4, granted: 0 }, { detail: true }), "$2.40");
 	});
+
+	it("shows a depleting wallet as remaining over topped-up, regardless of detail", () => {
+		const booster = { type: "balance" as const, symbol: "¥", total: 5, granted: 0, toppedUp: 20, label: "booster" };
+		assert.equal(formatBalanceCompact(booster), "¥5.00/¥20.00");
+		assert.equal(formatBalanceCompact(booster, { detail: true }), "¥5.00/¥20.00");
+		// Fully spent still reads against the top-up: the wallet exists, it is empty.
+		assert.equal(formatBalanceCompact({ ...booster, total: 0 }), "¥0.00/¥20.00");
+	});
 });
 
 describe("buildQuotaInline", () => {
@@ -401,6 +409,20 @@ describe("formatQuotaPanel", () => {
 			},
 		};
 		assert.equal(formatQuotaPanel([tiny], now), "deepseek  pay as you go · ¥19.67");
+	});
+
+	it("labels a depleting wallet on the provider header", () => {
+		const kimi: QuotaPanelRow = {
+			label: "kimi-coding",
+			planLabel: "coding plan",
+			planLevel: "allegretto",
+			snapshot: {
+				kind: "kimi",
+				fetchedAt: now,
+				items: [{ type: "balance", symbol: "¥", total: 100, granted: 0, toppedUp: 200, label: "booster" }],
+			},
+		};
+		assert.equal(formatQuotaPanel([kimi], now), "kimi-coding  coding plan · Allegretto · booster ¥100.00/¥200.00");
 	});
 });
 

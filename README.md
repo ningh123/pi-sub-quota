@@ -65,7 +65,7 @@ zai-coding-cn  coding plan · Max · active
 
 deepseek  pay as you go · ¥19.67 + ¥1.00 granted · $2.50
 
-kimi-coding  coding plan · Allegretto
+kimi-coding  coding plan · Allegretto · booster ¥100.00/¥200.00
   5h  ▓▓▓▓▓▓▓░░░   30% left   reset 17:10
   7d  ▓░░░░░░░░░   89% left   reset Mon 00:00
 
@@ -79,7 +79,7 @@ The footer shows how much you have used; the panel shows what is left, as a mete
 | Provider | What you see |
 | --- | --- |
 | ZAI / GLM coding plans — `zai-coding-cn`, `zai-coding`, GLM and bigmodel aliases | 5h / 7d usage windows with resets, your plan tier (Lite / Pro / Max) |
-| Kimi — `kimi-coding` | weekly request quota + 5h rate limit, membership tier (Andante / Moderato / Allegretto) |
+| Kimi — `kimi-coding` | 5h / 7d usage windows (+ 30d monthly pool on plans that report one), membership tier (Andante / Moderato / Allegretto) from the account endpoint, and the booster wallet balance (`booster ¥5.00/¥20.00`) once topped up |
 | DeepSeek — `deepseek` | prepaid balance per currency, topped-up + granted split |
 
 Custom providers work without configuration too: detection falls back to the model's base URL host (`bigmodel.cn`, `*.z.ai` with a `/coding` path, `*.kimi.com` / `*.kimi.ai` with a `/coding` path, `*.deepseek.com`).

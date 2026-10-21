@@ -39,10 +39,14 @@ export interface QuotaBalance {
 	type: "balance";
 	/** Currency symbol, e.g. "¥" or "$". */
 	symbol: string;
-	/** Total balance (topped up + granted), in the account currency. */
+	/** Spendable amount right now (topped up + granted, minus what depleting wallets already spent). */
 	total: number;
 	/** Granted (promotional) part of the balance; 0 when there is none. */
 	granted: number;
+	/** Original top-up of a depleting wallet (e.g. Kimi's booster); `total` then reads as remaining/toppedUp. */
+	toppedUp?: number;
+	/** Short qualifier for the panel header, e.g. "booster". */
+	label?: string;
 }
 
 /** One displayable quota item; a snapshot is an ordered list of these. */
