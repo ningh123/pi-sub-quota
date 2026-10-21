@@ -24,8 +24,8 @@ Restart pi (or run `/reload`). There is nothing to configure: the extension reus
 
 | Command | Effect |
 | --- | --- |
-| `/quota` | quota for every configured provider, as a panel |
-| `/quota refresh` | fetch fresh numbers for the active provider now |
+| `/quota` | cached quota for every configured provider, instantly — stale numbers refresh in the background and the panel updates when they land |
+| `/quota refresh` | force a re-fetch for the active provider now (at most one request per provider per minute, machine-wide) |
 | `/quota mode inline\|line\|off` | how — and whether — the footer shows quota |
 | `/quota help` | list options |
 
@@ -72,7 +72,7 @@ kimi-coding  coding plan · Allegretto · booster ¥100.00/¥200.00
 /quota refresh · /quota mode line|inline|off · /quota help
 ```
 
-The footer shows how much you have used; the panel shows what is left, as a meter and a percentage, with each reset as a concrete local time (`13:47` today, `Fri 15:00` this week, `Sep 01` later).
+The footer shows how much you have used; the panel shows what is left, as a meter and a percentage, with each reset as a concrete local time (`13:47` today, `Fri 15:00` this week, `Sep 01` later). The panel never waits on the network: whatever is cached renders the moment you press Enter — old numbers carry a `~`, missing ones read `fetching…` — and a second panel replaces it once the refreshed numbers land.
 
 ## Supported providers
 
@@ -86,8 +86,9 @@ Custom providers work without configuration too: detection falls back to the mod
 
 ## Good to know
 
-- Numbers refresh at most every five minutes; countdowns tick every minute without touching the network.
-- A failed refresh never breaks anything: the last numbers stay, marked `~`, until the next success — and `/quota` says why a provider failed (`quota unavailable (HTTP 401)`).
+- Numbers refresh while you work — on model switches and on every agent run — but at most once every five minutes per provider; an idle session, mode `off`, and non-TUI sessions (RPC, JSON) send no requests at all.
+- Each provider endpoint is asked at most once per minute, machine-wide: every attempt (even a failed one) persists its timestamp in the shared cache before the request starts, so several pi sessions keep their distance too.
+- A failed refresh never breaks anything: the last numbers stay, marked `~`, until the next success — and `/quota` says why a provider failed (`quota unavailable (HTTP 401)`) or when it will retry (`retry in 42s`).
 - Several pi sessions on the same machine share one cache safely.
 - A lapsed Kimi OAuth token is skipped with a note — it refreshes the next time pi itself calls Kimi.
 - Credentials come only from pi's own store; no environment variables are read, and a key can never be sent to the wrong host.

@@ -20,10 +20,23 @@
  * quota provider is active and a snapshot with at least one item exists.
  * With no data at all (missing API key, empty cache, failed fetch) — and in
  * off mode, or after switching to a provider without quota — the built-in
- * footer stays completely untouched. Snapshots are fetched at most every
- * five minutes, cached in `<agent-dir>/quota-cache.json`, and when a
- * refresh fails the last snapshot is kept with a warning `~` prefix until a
- * fetch succeeds again.
+ * footer stays completely untouched. Snapshots live in
+ * `<agent-dir>/quota-cache.json` with a five-minute TTL, shared (and
+ * written atomically) by every pi session on the machine.
+ *
+ * Fetches never run on a wall clock; they happen on demand and on activity:
+ *   - `/quota` renders every configured provider from cache instantly —
+ *     stale snapshots keep their numbers behind a `~` — then refreshes the
+ *     stale ones in the background and re-renders once when data landed;
+ *   - `/quota refresh` force-refreshes the active provider;
+ *   - agent runs (`agent_start` / `agent_end`) and model switches refresh
+ *     the active provider, TTL-gated — an idle session, mode off, and
+ *     non-TUI sessions (RPC, JSON, print) send no requests at all.
+ * Each provider endpoint is asked at most once per minute machine-wide:
+ * every attempt, successful or not, persists `lastRequests` in the cache
+ * file before the request starts, so concurrent sessions and failing
+ * endpoints keep their distance too. When a refresh fails, the last
+ * snapshot is kept with a warning `~` prefix until a fetch succeeds again.
  *
  * Display modes (persisted in `<agent-dir>/quota-settings.json`):
  *   line     dedicated quota line under the stats with labeled meters and
@@ -33,8 +46,9 @@
  *   off      restore the built-in footer entirely
  *
  * Commands:
- *   /quota             show quota for every configured provider
- *   /quota refresh     force a re-fetch for the active provider
+ *   /quota             cached quota for every configured provider, instantly;
+ *                     refreshed in the background and re-rendered when done
+ *   /quota refresh     force a re-fetch for the active provider (once per minute at most)
  *   /quota mode line|inline|off  change display mode (persisted)
  *   /quota help        list options
  */
@@ -44,15 +58,32 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { emptyCache, freshSnapshot, isNewerCacheFile, parseCache, type QuotaCacheFile, serializeCache } from "./cache.ts";
+import {
+	emptyCache,
+	freshSnapshot,
+	isNewerCacheFile,
+	parseCache,
+	type QuotaCacheFile,
+	requestDue,
+	serializeCache,
+} from "./cache.ts";
 import { createQuotaFooter } from "./footer.ts";
-import { configuredQuotaProviders, detectProvider, type QuotaProvider, type QuotaSnapshot } from "./providers/index.ts";
+import {
+	type ConfiguredQuotaProvider,
+	configuredQuotaProviders,
+	detectProvider,
+	type ProviderKind,
+	type QuotaProvider,
+	type QuotaSnapshot,
+} from "./providers/index.ts";
 import { DEFAULT_MODE, MODES, parseSettings, type QuotaMode, serializeSettings } from "./settings.ts";
 import { formatQuota, formatQuotaPanel, type QuotaPanelRow } from "./view.ts";
 
 const CACHE_TTL_MS = 300_000;
 const TICK_MS = 60_000;
 const FETCH_TIMEOUT_MS = 8000;
+/** No provider endpoint is asked more often than this, machine-wide. */
+const MIN_REQUEST_INTERVAL_MS = 60_000;
 
 /** The model fields detection needs; structurally compatible with pi's Model. */
 interface ActiveModel {
@@ -75,6 +106,8 @@ let footerInstalled = false;
 let activeCtx: ExtensionContext | undefined;
 /** Listeners notified whenever the snapshot, staleness, or mode changes (footer re-renders). */
 const snapshotListeners = new Set<() => void>();
+/** Last fetch attempt per provider in this process — the cache file shares them across sessions. */
+const lastAttempts = new Map<ProviderKind, number>();
 
 function publishSnapshot(): void {
 	for (const listener of snapshotListeners) listener();
@@ -91,11 +124,19 @@ function oauthExpired(entry: unknown): boolean {
 	return typeof expires === "number" && expires <= Date.now() + 30_000;
 }
 
+/** True when the auth entry carries a credential a fetch could use: an unexpired OAuth access token or an API key. */
+function hasUsableCredential(entry: unknown): boolean {
+	if (typeof entry !== "object" || entry === null) return false;
+	if (oauthExpired(entry)) return false;
+	const { access, key } = entry as { access?: unknown; key?: unknown };
+	return typeof (access ?? key) === "string";
+}
+
 /**
  * Read the credential for a provider from pi's auth.json: the OAuth access
  * token (`access`) for OAuth providers such as kimi-coding, the API `key`
  * otherwise. The file is re-read on every fetch so a token pi refreshed
- * mid-session is picked up on the next tick. A lapsed OAuth token counts as
+ * mid-session is picked up on the next request. A lapsed OAuth token counts as
  * no credential — pi only refreshes it when it calls the provider itself,
  * so requesting with it would be a guaranteed 401.
  */
@@ -152,8 +193,23 @@ async function saveMode(mode: QuotaMode): Promise<void> {
 	publishSnapshot();
 }
 
-/** Read-modify-write with a rename, so concurrent pi sessions never read a torn file. */
-async function writeCacheSnapshot(snapshot: QuotaSnapshot): Promise<void> {
+/** The cache write in flight, if any; in-process writers queue behind it. */
+let cacheWriteChain: Promise<void> = Promise.resolve();
+
+/**
+ * Read-modify-write with a rename, so concurrent pi sessions never read a
+ * torn file. Writes are serialized in-process first: the /quota panel
+ * refreshes several providers in parallel, and two interleaved
+ * read-modify-write cycles would silently drop whichever update renamed
+ * first. performCacheWrite never rejects, so the chain cannot break.
+ */
+async function writeCacheFile(update: (cache: QuotaCacheFile) => void): Promise<void> {
+	const write = cacheWriteChain.then(() => performCacheWrite(update));
+	cacheWriteChain = write;
+	await write;
+}
+
+async function performCacheWrite(update: (cache: QuotaCacheFile) => void): Promise<void> {
 	const path = join(agentDir(), "quota-cache.json");
 	try {
 		const text = await readFile(path, "utf8").catch(() => undefined);
@@ -161,7 +217,7 @@ async function writeCacheSnapshot(snapshot: QuotaSnapshot): Promise<void> {
 		// this version would silently discard whatever that format stored.
 		if (isNewerCacheFile(text)) return;
 		const cache = parseCache(text);
-		cache.snapshots[snapshot.kind] = snapshot;
+		update(cache);
 		// A unique tmp name per writer: two sessions sharing one fixed tmp path
 		// could interleave writes into the same file and rename a torn result.
 		const tmp = `${path}.${process.pid}-${Math.random().toString(36).slice(2)}.tmp`;
@@ -172,34 +228,101 @@ async function writeCacheSnapshot(snapshot: QuotaSnapshot): Promise<void> {
 	}
 }
 
-async function fetchSnapshot(
-	provider: QuotaProvider,
-	providerId: string | undefined,
-	baseUrl?: string,
-): Promise<QuotaSnapshot | undefined> {
-	// Credentials come exclusively from pi's auth.json: the same credential pi
-	// itself runs the provider with, so a matched provider always has its key
-	// and no environment fallback can pair a key with a foreign host.
-	const apiKey = await readAuthKey(providerId);
-	if (!apiKey) return undefined;
-	return provider.fetchQuota(apiKey, { now: Date.now, timeoutMs: FETCH_TIMEOUT_MS, baseUrl });
+/** Store a fetched snapshot, keeping every other provider's data and attempt times. */
+async function writeCacheSnapshot(snapshot: QuotaSnapshot): Promise<void> {
+	await writeCacheFile((cache) => {
+		cache.snapshots[snapshot.kind] = snapshot;
+	});
 }
 
-async function refresh(force: boolean): Promise<QuotaSnapshot | undefined> {
+/** Persist a fetch-attempt time so every pi session on the machine shares one rate limit. */
+async function writeCacheLastRequest(kind: ProviderKind, now: number): Promise<void> {
+	await writeCacheFile((cache) => {
+		cache.lastRequests = { ...cache.lastRequests, [kind]: now };
+	});
+}
+
+/** One provider's fetch outcome, including why no fresh data arrived. */
+type FetchOutcome =
+	| { status: "fetched"; snapshot: QuotaSnapshot }
+	| { status: "limited" }
+	| { status: "no-credential" }
+	| { status: "error"; message: string };
+
+/**
+ * Reserve the next request slot for a provider: true when at least
+ * MIN_REQUEST_INTERVAL_MS has passed since any session last attempted a
+ * fetch. The attempt time is persisted before the request starts, so even
+ * concurrent sessions and failing endpoints keep at least a minute between
+ * requests machine-wide (a read-write race can still admit one duplicate,
+ * which only costs one extra status request).
+ */
+async function reserveFetchSlot(kind: ProviderKind): Promise<boolean> {
+	const now = Date.now();
+	const local = lastAttempts.get(kind);
+	if (local !== undefined && !requestDue(local, now, MIN_REQUEST_INTERVAL_MS)) return false;
+	const persisted = (await readCacheFile()).lastRequests?.[kind];
+	if (typeof persisted === "number" && !requestDue(persisted, now, MIN_REQUEST_INTERVAL_MS)) {
+		// Adopt the other session's timestamp so this process counts down from it.
+		lastAttempts.set(kind, Math.max(persisted, local ?? 0));
+		return false;
+	}
+	lastAttempts.set(kind, now);
+	await writeCacheLastRequest(kind, now);
+	return true;
+}
+
+/**
+ * Fetch one provider's quota and cache the snapshot, honoring the
+ * machine-wide request interval. Credentials come exclusively from pi's
+ * auth.json: the same credential pi itself runs the provider with, so no
+ * environment fallback can pair a key with a foreign host.
+ */
+async function fetchAndCache(provider: QuotaProvider, providerId: string | undefined, baseUrl?: string): Promise<FetchOutcome> {
+	const apiKey = await readAuthKey(providerId);
+	if (!apiKey) return { status: "no-credential" };
+	if (!(await reserveFetchSlot(provider.kind))) return { status: "limited" };
+	try {
+		const snapshot = await provider.fetchQuota(apiKey, { now: Date.now, timeoutMs: FETCH_TIMEOUT_MS, baseUrl });
+		await writeCacheSnapshot(snapshot);
+		return { status: "fetched", snapshot };
+	} catch (error) {
+		// Expected while offline or on provider errors: keep showing the last
+		// snapshot instead of logging — pi shows extension stderr to the user,
+		// and a dropped status fetch is not an error worth interrupting anyone for.
+		return { status: "error", message: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+/** What a refresh cycle produced for the active provider. */
+interface RefreshResult {
+	/** Latest snapshot for the active provider, from memory or cache. */
+	snapshot?: QuotaSnapshot;
+	/** True when this call brought back fresh numbers. */
+	fetched: boolean;
+	/** True when the request was skipped: some session asked within the last minute. */
+	limited: boolean;
+}
+
+async function refresh(opts: { force?: boolean } = {}): Promise<RefreshResult> {
 	const provider = activeProvider;
-	if (!provider || refreshing) return currentSnapshot;
+	if (!provider || refreshing) return { snapshot: currentSnapshot, fetched: false, limited: false };
 	/** True when the model switched to another provider since this refresh started. */
 	const switchedProvider = () => provider.kind !== activeProvider?.kind;
 	refreshing = true;
+	let fetched = false;
+	let limited = false;
+	/** The snapshot this cycle fetched, if any — reported even when a mid-fetch model switch keeps it out of the footer. */
+	let fetchedSnapshot: QuotaSnapshot | undefined;
 	try {
-		if (!force) {
+		if (!opts.force) {
 			const cached = await readCacheFile().then((cache) => cache.snapshots[provider.kind]);
 			if (!switchedProvider() && freshSnapshot(cached, Date.now(), CACHE_TTL_MS)) {
 				currentSnapshot = cached;
 				stale = false;
 				await syncFooterInstall();
 				publishSnapshot();
-				return currentSnapshot;
+				return { snapshot: currentSnapshot, fetched: false, limited: false };
 			}
 			// Show the last snapshot of any age while a refresh is in flight, so the
 			// footer never waits on the network with nothing to display.
@@ -210,16 +333,11 @@ async function refresh(force: boolean): Promise<QuotaSnapshot | undefined> {
 				publishSnapshot();
 			}
 		}
-		let next: QuotaSnapshot | undefined;
-		try {
-			next = await fetchSnapshot(provider, activeProviderId, activeBaseUrl);
-			if (next) await writeCacheSnapshot(next);
-		} catch {
-			// Expected while offline or on provider errors: keep showing the
-			// last snapshot (marked stale below) instead of logging — pi shows
-			// extension stderr to the user, and a dropped status fetch is not
-			// an error worth interrupting anyone for.
-		}
+		const outcome = await fetchAndCache(provider, activeProviderId, activeBaseUrl);
+		limited = outcome.status === "limited";
+		fetchedSnapshot = outcome.status === "fetched" ? outcome.snapshot : undefined;
+		fetched = fetchedSnapshot !== undefined;
+		let next = fetchedSnapshot;
 		// The model switched mid-fetch: the result belongs to the previous
 		// provider and must never bleed into the new provider's prefix.
 		if (next && switchedProvider()) next = undefined;
@@ -231,8 +349,9 @@ async function refresh(force: boolean): Promise<QuotaSnapshot | undefined> {
 			currentSnapshot = await readCacheFile().then((cache) => cache.snapshots[provider.kind]);
 			stale = true;
 		} else if (currentSnapshot) {
-			// Keep showing the last snapshot, marked stale.
-			stale = true;
+			// Keep showing the last snapshot. A failed refresh marks it stale; a
+			// rate-limited or credential-less skip only when it is past the TTL.
+			stale = outcome.status === "error" || !freshSnapshot(currentSnapshot, Date.now(), CACHE_TTL_MS);
 		}
 		await syncFooterInstall();
 		publishSnapshot();
@@ -241,9 +360,12 @@ async function refresh(force: boolean): Promise<QuotaSnapshot | undefined> {
 	}
 	// A model switch that arrived while this refresh was in flight left its
 	// own sync() call a no-op behind the refreshing guard; catch up for the
-	// new provider immediately instead of waiting for the next tick.
-	if (activeProvider && activeProvider.kind !== provider.kind) void refresh(false).catch(() => {});
-	return currentSnapshot;
+	// new provider immediately instead of waiting for the next activity.
+	if (activeProvider && activeProvider.kind !== provider.kind) void refresh().catch(() => {});
+	// Report what this call produced: the fetched snapshot even when a
+	// mid-fetch model switch kept it out of the footer (describeSnapshot
+	// names its kind), else the active provider's latest from memory.
+	return { snapshot: fetchedSnapshot ?? currentSnapshot, fetched, limited };
 }
 
 function stopTimer(): void {
@@ -255,13 +377,11 @@ function stopTimer(): void {
 
 function startTimer(): void {
 	if (tickTimer !== undefined) return;
-	// Refresh() reads the cache first, so the tick only hits the network
-	// about once per TTL. Unref'd so the timer never keeps pi alive.
-	tickTimer = setInterval(() => {
-		// Swallow rejections: a status side channel must never surface an
-		// unhandled-rejection crash if a refresh path throws unexpectedly.
-		void refresh(false).catch(() => {});
-	}, TICK_MS);
+	// Render-only tick: countdowns and reset times stay current once a minute
+	// without touching the network — fetches happen on activity (agent runs,
+	// model switches) and on demand (/quota), never on a wall clock. Unref'd
+	// so the timer never keeps pi alive.
+	tickTimer = setInterval(() => publishSnapshot(), TICK_MS);
 	tickTimer.unref?.();
 }
 
@@ -340,15 +460,115 @@ async function sync(ctx: ExtensionContext, model: ActiveModel | undefined): Prom
 		return;
 	}
 	startTimer();
-	void refresh(false).catch(() => {});
+	void refresh().catch(() => {});
 }
 
-/** Load or fetch quota for every configured provider and render the panel. */
-async function describeAllProviders(): Promise<string> {
+/**
+ * Streaming activity (agent run started or finished): the active
+ * subscription's numbers may have moved with the work. Refresh in the
+ * background, TTL- and rate-gated — at most one request per CACHE_TTL_MS
+ * while the session is active, none while it sits idle or displays no
+ * footer (mode off, non-TUI). Never awaited: the agent loop must not
+ * wait on a status fetch.
+ */
+function onAgentActivity(): void {
+	// Off and non-TUI sessions show nothing (the /quota panel fetches on
+	// demand), so a background refresh there would be cost without a viewer.
+	if (currentMode === "off" || (activeCtx !== undefined && activeCtx.mode !== "tui")) return;
+	void refresh().catch(() => {});
+}
+
+/** Short fetch-failure text for the panel; the endpoint is implied by the provider block it belongs to. */
+function panelFetchError(message: string): string {
+	return message.replace(/ from \S+.*$/, "");
+}
+
+/**
+ * One configured provider as a panel row, rendered from cache alone: fresh
+ * snapshots as-is, stale ones with their numbers kept and marked `~`,
+ * missing ones as a note — "fetching…" while a refresh is in flight, the
+ * failure reason or retry countdown after it failed.
+ */
+function panelRow(
+	entry: ConfiguredQuotaProvider,
+	authFile: Record<string, unknown> | undefined,
+	cached: QuotaSnapshot | undefined,
+	opts: { pending: boolean; fetchError?: string; retryInSeconds?: number },
+	now: number,
+): QuotaPanelRow {
+	const row: QuotaPanelRow = {
+		label: entry.providerId,
+		planLabel: entry.provider.planLabel,
+		active: entry.provider.kind === activeProvider?.kind,
+	};
+	if (cached) {
+		// Any age: show the numbers now — old ones marked stale (~), replaced
+		// by the pending refresh when it lands. freshSnapshot is a type guard,
+		// so the age check is inlined to keep `cached` narrowed here.
+		const fresh = now - cached.fetchedAt < CACHE_TTL_MS;
+		return fresh
+			? { ...row, planLevel: cached.planLevel, snapshot: cached }
+			: { ...row, planLevel: cached.planLevel, snapshot: cached, stale: true };
+	}
+	if (opts.pending) return { ...row, note: "fetching…" };
+	if (opts.fetchError) return { ...row, note: `quota unavailable (${panelFetchError(opts.fetchError)})` };
+	if (oauthExpired(authFile?.[entry.providerId])) {
+		return { ...row, note: "oauth token expired; it refreshes the next time pi uses this provider" };
+	}
+	if (opts.retryInSeconds !== undefined) return { ...row, note: `quota unavailable (retry in ${opts.retryInSeconds}s)` };
+	return row;
+}
+
+/** The /quota panel text for one cache state; pending and errors describe an in-flight refresh. */
+function renderPanel(
+	ordered: readonly ConfiguredQuotaProvider[],
+	authFile: Record<string, unknown> | undefined,
+	cache: QuotaCacheFile,
+	pending: ReadonlySet<ProviderKind>,
+	errors: ReadonlyMap<ProviderKind, string>,
+): string {
+	const now = Date.now();
+	const rows = ordered.map((entry): QuotaPanelRow => {
+		const kind = entry.provider.kind;
+		const lastRequestAt = cache.lastRequests?.[kind];
+		// A credential-less provider never fetches, so a recent attempt only
+		// matters as a retry note when a request could follow.
+		const retryInSeconds =
+			pending.has(kind) || !hasUsableCredential(authFile?.[entry.providerId])
+				? undefined
+				: lastRequestAt !== undefined && !requestDue(lastRequestAt, now, MIN_REQUEST_INTERVAL_MS)
+					? Math.ceil((lastRequestAt + MIN_REQUEST_INTERVAL_MS - now) / 1000)
+					: undefined;
+		return panelRow(
+			entry,
+			authFile,
+			cache.snapshots[kind],
+			{
+				pending: pending.has(kind),
+				fetchError: errors.get(kind),
+				retryInSeconds,
+			},
+			now,
+		);
+	});
+	return `${formatQuotaPanel(rows, now)}\n\n/quota refresh · /quota mode line|inline|off · /quota help`;
+}
+
+/**
+ * Show the /quota panel without waiting on the network: the cached state of
+ * every configured provider renders immediately (stale snapshots keep their
+ * numbers behind `~`, missing ones read "fetching…"), then the stale or
+ * missing providers refresh in the background and the panel re-renders
+ * once — unless nothing changed (every fetch failed with only stale
+ * numbers shown, which the first panel already says with its `~` marks).
+ */
+async function showQuotaPanel(ctx: ExtensionContext): Promise<void> {
 	const authFile = await readAuthFile();
 	const configured = configuredQuotaProviders(authFile);
-	if (configured.length === 0) return "no quota providers configured";
-	const cache = await readCacheFile();
+	if (configured.length === 0) {
+		ctx.ui.notify("no quota providers configured", "info");
+		return;
+	}
 	// Active provider first, the rest alphabetical by display label —
 	// predictable and stable, independent of auth.json key order.
 	const ordered = [...configured].sort((a, b) => {
@@ -356,47 +576,45 @@ async function describeAllProviders(): Promise<string> {
 		if (b.provider.kind === activeProvider?.kind) return 1;
 		return a.providerId < b.providerId ? -1 : a.providerId > b.providerId ? 1 : 0;
 	});
-	const rows = await Promise.all(
-		ordered.map(async (entry): Promise<QuotaPanelRow> => {
-			const { provider } = entry;
-			const row: QuotaPanelRow = {
-				label: entry.providerId,
-				planLabel: provider.planLabel,
-				active: provider.kind === activeProvider?.kind,
-			};
-			const cached = cache.snapshots[provider.kind];
-			let snapshot: QuotaSnapshot | undefined;
-			let stale = false;
-			let fetchError: string | undefined;
-			if (freshSnapshot(cached, Date.now(), CACHE_TTL_MS)) {
-				snapshot = cached;
-			} else {
-				try {
-					snapshot = await fetchSnapshot(provider, entry.providerId);
-				} catch (error) {
-					// Keep the reason short: the panel is narrow, and the endpoint
-					// is implied by the provider block it belongs to.
-					fetchError = error instanceof Error ? error.message.replace(/ from \S+.*$/, "") : String(error);
-				}
-				if (snapshot) {
-					await writeCacheSnapshot(snapshot);
-				} else if (cached) {
-					// Fetch failed: fall back to the cached snapshot of any age, marked stale.
-					snapshot = cached;
-					stale = true;
-				}
-			}
-			const note = !snapshot
-				? fetchError
-					? `quota unavailable (${fetchError})`
-					: oauthExpired(authFile?.[entry.providerId])
-						? "oauth token expired; it refreshes the next time pi uses this provider"
-						: undefined
-				: undefined;
-			return { ...row, planLevel: snapshot?.planLevel, snapshot, stale, note };
+	const cache = await readCacheFile();
+	const now = Date.now();
+	// Providers needing a fetch: a stale-or-missing snapshot, a usable
+	// credential, and the machine-wide request interval elapsed. The rate
+	// limit itself lives in fetchAndCache; this only keeps the first render
+	// honest about what is about to happen.
+	const due = ordered.filter(
+		(entry) =>
+			!freshSnapshot(cache.snapshots[entry.provider.kind], now, CACHE_TTL_MS) &&
+			hasUsableCredential(authFile?.[entry.providerId]) &&
+			requestDue(cache.lastRequests?.[entry.provider.kind], now, MIN_REQUEST_INTERVAL_MS),
+	);
+	const first = renderPanel(ordered, authFile, cache, new Set(due.map((entry) => entry.provider.kind)), new Map());
+	ctx.ui.notify(first, "info");
+	if (due.length === 0) return;
+	const errors = new Map<ProviderKind, string>();
+	await Promise.allSettled(
+		due.map(async (entry) => {
+			// The active provider keeps its regional base URL; the rest use
+			// their default endpoint.
+			const baseUrl = entry.provider.kind === activeProvider?.kind ? activeBaseUrl : undefined;
+			const outcome = await fetchAndCache(entry.provider, entry.providerId, baseUrl);
+			if (outcome.status === "error") errors.set(entry.provider.kind, outcome.message);
 		}),
 	);
-	return `${formatQuotaPanel(rows, Date.now())}\n\n/quota refresh · /quota mode line|inline|off · /quota help`;
+	const refreshed = await readCacheFile();
+	// A fresh snapshot for the active provider also updates the footer —
+	// unless an activity refresh is mid-flight, which owns that state.
+	if (!refreshing && activeProvider) {
+		const activeCached = refreshed.snapshots[activeProvider.kind];
+		if (activeCached && freshSnapshot(activeCached, Date.now(), CACHE_TTL_MS)) {
+			currentSnapshot = activeCached;
+			stale = false;
+			await syncFooterInstall();
+			publishSnapshot();
+		}
+	}
+	const second = renderPanel(ordered, authFile, refreshed, new Set(), errors);
+	if (second !== first) ctx.ui.notify(second, "info");
 }
 
 function describeSnapshot(snapshot: QuotaSnapshot | undefined): string {
@@ -408,7 +626,7 @@ function describeSnapshot(snapshot: QuotaSnapshot | undefined): string {
 
 /** Sub-command hints for /quota autocompletion. */
 const SUBCOMMANDS: { value: string; label: string; description: string }[] = [
-	{ value: "refresh", label: "refresh", description: "force a re-fetch for the active provider" },
+	{ value: "refresh", label: "refresh", description: "force a re-fetch for the active provider (once per minute at most)" },
 	{ value: "mode", label: "mode", description: "switch display mode (line, inline, off)" },
 	{ value: "help", label: "help", description: "show usage" },
 ];
@@ -432,6 +650,10 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("model_select", async (event, ctx) => {
 		await sync(ctx, event.model);
 	});
+	// Run boundaries are the activity signal: refreshes ride on real work
+	// instead of a wall clock, so an idle session sends no requests at all.
+	pi.on("agent_start", onAgentActivity);
+	pi.on("agent_end", onAgentActivity);
 	pi.on("session_shutdown", () => {
 		// The runtime is about to be torn down (quit, /reload, session
 		// replacement): stop the tick timer so a reused module instance never
@@ -464,10 +686,20 @@ export default function (pi: ExtensionAPI): void {
 					ctx.ui.notify("Quota: a refresh is already in progress", "info");
 					return;
 				}
-				const snapshot = await refresh(true);
+				const result = await refresh({ force: true });
+				// A rate-limited skip still explains itself below, even with
+				// nothing cached yet to describe.
+				if (!result.snapshot && !result.limited) {
+					ctx.ui.notify("Quota: nothing to refresh", "warning");
+					return;
+				}
 				ctx.ui.notify(
-					snapshot ? `Quota refreshed: ${describeSnapshot(snapshot)}` : "Quota: nothing to refresh",
-					snapshot ? "info" : "warning",
+					result.fetched
+						? `Quota refreshed: ${describeSnapshot(result.snapshot)}`
+						: result.limited
+							? `Quota: requested within the last minute — ${describeSnapshot(result.snapshot)}`
+							: `Quota: refresh failed — ${describeSnapshot(result.snapshot)}`,
+					"info",
 				);
 				return;
 			}
@@ -495,8 +727,9 @@ export default function (pi: ExtensionAPI): void {
 				);
 				return;
 			}
-			// No argument (or anything unrecognized): show every configured provider.
-			ctx.ui.notify(await describeAllProviders(), "info");
+			// No argument (or anything unrecognized): cached numbers instantly,
+			// refreshed in the background and re-rendered when they land.
+			await showQuotaPanel(ctx);
 		},
 	});
 }

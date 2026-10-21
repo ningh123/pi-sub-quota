@@ -11,6 +11,12 @@ export const CACHE_VERSION = 2;
 export interface QuotaCacheFile {
 	version: number;
 	snapshots: Partial<Record<ProviderKind, QuotaSnapshot>>;
+	/**
+	 * Last fetch attempt per provider, in ms epoch. Persisted — not kept in
+	 * memory — so every pi session on the machine shares one rate limit and a
+	 * failing endpoint is retried at most once per interval machine-wide.
+	 */
+	lastRequests?: Partial<Record<ProviderKind, number>>;
 }
 
 export function emptyCache(): QuotaCacheFile {
@@ -84,7 +90,7 @@ export function parseCache(text: string | undefined): QuotaCacheFile {
 	try {
 		const raw: unknown = JSON.parse(text);
 		if (typeof raw !== "object" || raw === null) return emptyCache();
-		const file = raw as { version?: unknown; snapshots?: unknown };
+		const file = raw as { version?: unknown; snapshots?: unknown; lastRequests?: unknown };
 		if (file.version !== CACHE_VERSION || typeof file.snapshots !== "object" || file.snapshots === null) {
 			return emptyCache();
 		}
@@ -94,7 +100,19 @@ export function parseCache(text: string | undefined): QuotaCacheFile {
 				snapshots[kind as ProviderKind] = snapshot;
 			}
 		}
-		return { version: CACHE_VERSION, snapshots };
+		// Attempt times drive the request rate limit; an invalid entry simply
+		// does not limit — it must never block parsing of the snapshots.
+		const lastRequests: Partial<Record<ProviderKind, number>> = {};
+		if (typeof file.lastRequests === "object" && file.lastRequests !== null) {
+			for (const [kind, at] of Object.entries(file.lastRequests)) {
+				if ((PROVIDER_KINDS as readonly string[]).includes(kind) && typeof at === "number" && Number.isFinite(at)) {
+					lastRequests[kind as ProviderKind] = at;
+				}
+			}
+		}
+		const cache: QuotaCacheFile = { version: CACHE_VERSION, snapshots };
+		if (Object.keys(lastRequests).length > 0) cache.lastRequests = lastRequests;
+		return cache;
 	} catch {
 		return emptyCache();
 	}
@@ -124,4 +142,9 @@ export function isNewerCacheFile(text: string | undefined): boolean {
 /** True when the snapshot was fetched within the TTL window. */
 export function freshSnapshot(snapshot: QuotaSnapshot | undefined, now: number, ttlMs: number): snapshot is QuotaSnapshot {
 	return snapshot !== undefined && now - snapshot.fetchedAt < ttlMs;
+}
+
+/** True when a request may be sent: none was recorded, or the minimum interval since the last attempt has passed. */
+export function requestDue(lastRequestAt: number | undefined, now: number, minIntervalMs: number): boolean {
+	return lastRequestAt === undefined || now - lastRequestAt >= minIntervalMs;
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { CACHE_VERSION, emptyCache, freshSnapshot, isNewerCacheFile, parseCache, serializeCache } from "../cache.ts";
+import { CACHE_VERSION, emptyCache, freshSnapshot, isNewerCacheFile, parseCache, requestDue, serializeCache } from "../cache.ts";
 import type { QuotaSnapshot } from "../providers/index.ts";
 
 const zaiSnapshot: QuotaSnapshot = {
@@ -127,6 +127,53 @@ describe("parseCache", () => {
 		// The same snapshot with finite values stays.
 		const finite = JSON.stringify({ version: 2, snapshots: { zai: zaiSnapshot } });
 		assert.deepEqual(parseCache(finite).snapshots, { zai: zaiSnapshot });
+	});
+
+	describe("lastRequests", () => {
+		it("round-trips through serializeCache", () => {
+			const cache = emptyCache();
+			cache.snapshots.zai = zaiSnapshot;
+			cache.lastRequests = { zai: 1_000, kimi: 2_000 };
+			const parsed = parseCache(serializeCache(cache));
+			assert.deepEqual(parsed, cache);
+		});
+
+		it("drops unknown kinds and non-finite times but keeps the rest", () => {
+			const text = JSON.stringify({
+				version: 2,
+				snapshots: {},
+				lastRequests: { zai: 1_000, anthropic: 2_000, kimi: "soon", deepseek: Number.NaN },
+			});
+			const parsed = parseCache(text);
+			assert.deepEqual(parsed.lastRequests, { zai: 1_000 });
+		});
+
+		it("stays optional so older files keep parsing", () => {
+			const parsed = parseCache(JSON.stringify({ version: 2, snapshots: { zai: zaiSnapshot } }));
+			assert.equal(parsed.lastRequests, undefined);
+			assert.deepEqual(parsed.snapshots, { zai: zaiSnapshot });
+		});
+	});
+});
+
+describe("requestDue", () => {
+	const interval = 60_000;
+
+	it("is due without a recorded request and once the interval has passed", () => {
+		assert.equal(requestDue(undefined, 0, interval), true);
+		assert.equal(requestDue(1_000, 1_000 + interval, interval), true);
+		assert.equal(requestDue(1_000, 1_000 + interval + 1, interval), true);
+	});
+
+	it("is not due inside the interval", () => {
+		assert.equal(requestDue(1_000, 1_000, interval), false);
+		assert.equal(requestDue(1_000, 1_000 + interval - 1, interval), false);
+	});
+
+	it("tolerates clock skew from the future", () => {
+		// A lastRequest slightly in the future (clock skew) has negative age,
+		// which still counts as inside the interval.
+		assert.equal(requestDue(2_000, 1_000, interval), false);
 	});
 });
 

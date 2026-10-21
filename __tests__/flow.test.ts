@@ -12,6 +12,7 @@
 
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -133,12 +134,47 @@ async function seedAgentDir(dir: string, mode: string, snapshot: QuotaSnapshot |
 	);
 }
 
-/** Sync() kicks refresh() off without awaiting it; installation lands a few ticks later. */
+/**
+ * Sync() kicks refresh() off without awaiting it; installation lands a few
+ * ticks later. Fails the test when the condition never arrives, so a
+ * dropped refresh surfaces here instead of as a misleading later failure.
+ */
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!predicate() && Date.now() < deadline) {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
+	assert.ok(predicate(), `timed out after ${timeoutMs}ms waiting for a condition that never arrived`);
+}
+
+/**
+ * A local Kimi endpoint: /coding/v1/usages serves a weekly pool (limit 2048,
+ * used 1024 → 50%), /coding/v1/me the membership tier. Responses can be
+ * delayed so callers can prove something did NOT wait for the network.
+ * Counted requests let tests assert the machine-wide rate limit.
+ */
+async function startKimiServer(delayMs = 0): Promise<{ baseUrl: string; requests: () => number; close: () => void }> {
+	let requests = 0;
+	const server = http.createServer((req, res) => {
+		requests++;
+		setTimeout(() => {
+			const body = req.url?.endsWith("/me")
+				? { user_level_name: "moderato" }
+				: {
+						usage: { limit: "2048", used: "1024", resetTime: new Date(Date.now() + 3 * 24 * 3_600_000).toISOString() },
+						limits: [],
+					};
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify(body));
+		}, delayMs);
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const port = (server.address() as { port: number }).port;
+	return {
+		baseUrl: `http://127.0.0.1:${port}/coding/v1`,
+		requests: () => requests,
+		close: () => server.close(),
+	};
 }
 
 describe("extension flow", () => {
@@ -223,11 +259,13 @@ describe("extension flow", () => {
 			await new Promise((resolve) => setTimeout(resolve, 300));
 			assert.equal(pi.state.footerFactory, undefined, "a failed fetch must not install the footer");
 			assert.equal(errors.length, 0, "fetch failures must not write to the console");
-			// /quota refresh also stays quiet and explains itself via notify.
+			// /quota refresh also stays quiet and explains itself via notify: the
+			// boot attempt already failed (and persisted its timestamp), so the
+			// retry within the minute is rate-limited rather than "nothing to refresh".
 			const handler = pi.state.command?.handler;
 			assert.ok(handler);
 			await handler("refresh", pi.ctx);
-			assert.match(pi.state.notifications.at(-1) ?? "", /nothing to refresh/);
+			assert.match(pi.state.notifications.at(-1) ?? "", /within the last minute/);
 		} finally {
 			console.error = originalError;
 			await rm(join(agentDir, "auth.json"), { force: true });
@@ -447,5 +485,238 @@ describe("extension flow", () => {
 		assert.match(modeCompletion?.description ?? "", /\(line, inline, off\)/);
 		const modes = (pi.state.command?.getArgumentCompletions?.("mode ") ?? []).map((c) => c.value);
 		assert.deepEqual(modes, ["mode line", "mode inline", "mode off"]);
+	});
+
+	it("shows the cached panel instantly, then the refreshed one when the fetch lands", async () => {
+		// The endpoint answers slowly: the panel must render the stale cache
+		// first and re-render once the fresh numbers arrive, never block on it.
+		const server = await startKimiServer(400);
+		// Boot in mode "off": sync() then skips its startup refresh entirely
+		// (the panel works in every mode), so no request happens and no
+		// rate-limit slot is burned before the panel's own fetch.
+		await writeFile(join(agentDir, "auth.json"), JSON.stringify({ "kimi-coding": { type: "api_key" } }), "utf8");
+		try {
+			const pi = await boot("off", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), {
+				provider: "kimi-coding",
+				baseUrl: server.baseUrl,
+			});
+			await writeFile(
+				join(agentDir, "auth.json"),
+				JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+				"utf8",
+			);
+			const notifyAt: number[] = [];
+			const originalNotify = pi.ctx.ui.notify;
+			pi.ctx.ui.notify = (message: string) => {
+				notifyAt.push(Date.now());
+				originalNotify(message);
+			};
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			const startedAt = Date.now();
+			await handler("", pi.ctx);
+			assert.equal(pi.state.notifications.length, 2, "cached panel first, refreshed panel second");
+			assert.ok(notifyAt[0] - startedAt < 300, "the cached panel must appear before the fetch completes");
+			assert.match(pi.state.notifications[0], /~kimi-coding/, "the first panel shows the stale cache");
+			assert.match(pi.state.notifications[0], /87% left/);
+			assert.doesNotMatch(pi.state.notifications[1], /~/, "the second panel is no longer stale");
+			assert.match(pi.state.notifications[1], /Moderato/);
+			assert.match(pi.state.notifications[1], /50% left/);
+			// The fresh snapshot also landed in the shared cache file.
+			const cache = JSON.parse(await readFile(join(agentDir, "quota-cache.json"), "utf8"));
+			assert.equal(cache.snapshots.kimi.planLevel, "moderato");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("renders a single panel when every snapshot is fresh", async () => {
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "zai-coding-cn": { type: "api_key", key: "dummy-key" } }),
+			"utf8",
+		);
+		try {
+			const pi = await boot("inline", zaiSnapshot(13, 77, Date.now()));
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			await handler("", pi.ctx);
+			assert.equal(pi.state.notifications.length, 1, "a fresh cache needs no second panel");
+			assert.match(pi.state.notifications[0], /zai-coding-cn/);
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+		}
+	});
+
+	it("rate-limits manual refresh to one request per minute and persists the attempt", async () => {
+		// Startup refreshes the stale cache once; a manual refresh right after
+		// must be skipped as too recent — no second request, attempt persisted.
+		const server = await startKimiServer();
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+			"utf8",
+		);
+		try {
+			const pi = await boot("inline", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), {
+				provider: "kimi-coding",
+				baseUrl: server.baseUrl,
+			});
+			await waitFor(() => server.requests() >= 2); // /usages + /me
+			const requestsAfterBoot = server.requests();
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			await handler("refresh", pi.ctx);
+			assert.match(pi.state.notifications.at(-1) ?? "", /within the last minute/);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			assert.equal(server.requests(), requestsAfterBoot, "no second request inside the interval");
+			const cache = JSON.parse(await readFile(join(agentDir, "quota-cache.json"), "utf8"));
+			assert.equal(typeof cache.lastRequests?.kimi, "number", "the attempt time is persisted");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("refreshes the active provider on agent activity, TTL-gated, never when fresh", async () => {
+		// Boot without a credential (no request, no rate-limit slot burned),
+		// then make the cache stale, due, and credentialed: firing agent_start
+		// must fetch once; firing it again on the fresh cache must not.
+		const server = await startKimiServer();
+		await writeFile(join(agentDir, "auth.json"), JSON.stringify({ "kimi-coding": { type: "api_key" } }), "utf8");
+		try {
+			const pi = await boot("inline", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), {
+				provider: "kimi-coding",
+				baseUrl: server.baseUrl,
+			});
+			await writeFile(
+				join(agentDir, "auth.json"),
+				JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+				"utf8",
+			);
+			// Re-seed: stale snapshot, last request just past the interval.
+			await writeFile(
+				join(agentDir, "quota-cache.json"),
+				JSON.stringify({
+					version: 2,
+					snapshots: { kimi: kimiSnapshot(13, 77, Date.now() - 60 * MINUTE) },
+					lastRequests: { kimi: Date.now() - 61_000 },
+				}),
+				"utf8",
+			);
+			// Let the boot refresh settle before firing agent_start: it had no
+			// credential and sends no request, but its `refreshing` guard would
+			// silently drop an event that arrives while it is still open.
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			const agentStart = pi.state.listeners.get("agent_start");
+			assert.ok(agentStart, "agent_start listener registered");
+			await agentStart({}, pi.ctx);
+			await waitFor(() => server.requests() >= 2); // /usages + /me
+			// Fresh now: another activity burst must be a no-op on the network.
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			const afterFirst = server.requests();
+			await agentStart({}, pi.ctx);
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(server.requests(), afterFirst, "a fresh cache must not be re-fetched");
+			const cache = JSON.parse(await readFile(join(agentDir, "quota-cache.json"), "utf8"));
+			assert.equal(cache.snapshots.kimi.planLevel, "moderato");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("explains a rate-limited refresh even when nothing is cached yet", async () => {
+		// Mode off boots without a startup refresh, so the manual command is
+		// the only fetch path and the scenario is deterministic: another
+		// session asked 30s ago (persisted), nothing is cached, and the
+		// command must explain the skip instead of "nothing to refresh".
+		const server = await startKimiServer();
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+			"utf8",
+		);
+		try {
+			const pi = await boot("off", undefined, { provider: "kimi-coding", baseUrl: server.baseUrl });
+			await writeFile(
+				join(agentDir, "quota-cache.json"),
+				JSON.stringify({ version: 2, snapshots: {}, lastRequests: { kimi: Date.now() - 30_000 } }),
+				"utf8",
+			);
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			await handler("refresh", pi.ctx);
+			const message = pi.state.notifications.at(-1) ?? "";
+			assert.match(message, /within the last minute/);
+			assert.match(message, /no quota data yet/);
+			assert.equal(server.requests(), 0, "a limited refresh must not touch the network");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("reports a fetch that landed despite a mid-fetch model switch", async () => {
+		// A slow endpoint plus a model switch mid-fetch: the fetch succeeds
+		// for the previous provider. The command must report that honestly
+		// (naming the provider) instead of "nothing to refresh".
+		const server = await startKimiServer(400);
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+			"utf8",
+		);
+		try {
+			const pi = await boot("off", undefined, { provider: "kimi-coding", baseUrl: server.baseUrl });
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			const pending = handler("refresh", pi.ctx);
+			const onSelect = pi.state.listeners.get("model_select");
+			assert.ok(onSelect, "model_select listener registered");
+			await onSelect({ model: { provider: "anthropic", id: "claude-4" } }, pi.ctx);
+			await pending;
+			const message = pi.state.notifications.at(-1) ?? "";
+			assert.match(message, /Quota refreshed/);
+			assert.match(message, /\(kimi\)/, "the report names the provider whose numbers landed");
+			assert.doesNotMatch(message, /nothing to refresh/);
+			assert.equal(pi.state.footerFactory, undefined, "the switched-away provider must not install the footer");
+			// The fetched numbers still landed in the shared cache.
+			const cache = JSON.parse(await readFile(join(agentDir, "quota-cache.json"), "utf8"));
+			assert.equal(cache.snapshots.kimi.planLevel, "moderato");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("sends no background requests in off mode or outside the TUI", async () => {
+		// Activity refreshes only run where a footer could show them: mode
+		// off and non-TUI sessions (RPC) stay completely quiet on agent
+		// activity — the /quota panel fetches on demand, never in the background.
+		const server = await startKimiServer();
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+			"utf8",
+		);
+		try {
+			const model = { provider: "kimi-coding", baseUrl: server.baseUrl };
+			const off = await boot("off", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), model);
+			const offStart = off.state.listeners.get("agent_start");
+			assert.ok(offStart, "agent_start listener registered");
+			await offStart({}, off.ctx);
+			await off.state.listeners.get("agent_end")?.({}, off.ctx);
+			const rpc = await boot("inline", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), model, "rpc");
+			const rpcStart = rpc.state.listeners.get("agent_start");
+			assert.ok(rpcStart);
+			await rpcStart({}, rpc.ctx);
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(server.requests(), 0, "off and non-TUI sessions must not fetch on activity");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
 	});
 });
