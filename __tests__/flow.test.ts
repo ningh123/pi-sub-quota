@@ -1,0 +1,451 @@
+/**
+ * Integration flow tests: drive the extension entry (index.ts) against a
+ * temp agent directory and a fake pi context, then render the installed
+ * footer factory — verifying the wiring that pure view tests cannot reach:
+ * footer installation gating per mode, lifecycle (model switch, session
+ * replacement, shutdown), staleness, and what line/inline actually render.
+ *
+ * Network is avoided by seeding a cache; failing-fetch paths point at
+ * 127.0.0.1:1 (connection refused). Credentials come only from the temp
+ * agent dir's auth.json, exactly like production.
+ */
+
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, before, describe, it } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
+
+import type { QuotaSnapshot } from "../providers/index.ts";
+
+const MINUTE = 60_000;
+
+/** A snapshot of either token-window provider shape, keyed by kind. */
+function windowSnapshot(kind: "zai" | "kimi", used5h: number, used7d: number, fetchedAt: number): QuotaSnapshot {
+	return {
+		kind,
+		fetchedAt,
+		planLevel: "max",
+		items: [
+			{
+				type: "window",
+				resource: "tokens",
+				label: "5h",
+				usedPercent: used5h,
+				resetAt: fetchedAt + 4 * 60 * MINUTE,
+				durationMs: 5 * 3_600_000,
+			},
+			{
+				type: "window",
+				resource: "tokens",
+				label: "7d",
+				usedPercent: used7d,
+				resetAt: fetchedAt + 3 * 24 * 60 * MINUTE,
+				durationMs: 7 * 24 * 3_600_000,
+			},
+		],
+	};
+}
+
+const zaiSnapshot = (used5h: number, used7d: number, fetchedAt: number) => windowSnapshot("zai", used5h, used7d, fetchedAt);
+const kimiSnapshot = (used5h: number, used7d: number, fetchedAt: number) => windowSnapshot("kimi", used5h, used7d, fetchedAt);
+
+/** Fake pi surfaces: captures setFooter/notify and the registered command. */
+function createFakePi() {
+	const state = {
+		footerFactory: undefined as ((tui: unknown, theme: unknown, data: unknown) => unknown) | undefined,
+		notifications: [] as string[],
+		listeners: new Map<string, (event: unknown, ctx: unknown) => Promise<void> | void>(),
+		command: undefined as
+			| {
+					handler: (args: string, ctx: unknown) => Promise<void>;
+					getArgumentCompletions?: (prefix: string) => { value: string; label: string; description: string }[];
+			  }
+			| undefined,
+	};
+	return {
+		state,
+		api: {
+			on(event: string, listener: (event: unknown, ctx: unknown) => Promise<void> | void) {
+				state.listeners.set(event, listener);
+			},
+			registerCommand(
+				_name: string,
+				def: {
+					handler: (args: string, ctx: unknown) => Promise<void>;
+					getArgumentCompletions?: (prefix: string) => { value: string; label: string; description: string }[];
+				},
+			) {
+				state.command = def;
+			},
+		},
+		ctx: {
+			mode: "tui",
+			model: { id: "glm-5.3", provider: "zai-coding-cn", reasoning: true },
+			thinkingLevel: "max",
+			getContextUsage: () => undefined,
+			sessionManager: {
+				getEntries: () => [],
+				getLeafId: () => null,
+				getCwd: () => "/dev/project",
+				getSessionName: () => undefined,
+			},
+			ui: {
+				setFooter(factory: ((tui: unknown, theme: unknown, data: unknown) => unknown) | undefined) {
+					state.footerFactory = factory;
+				},
+				notify(message: string) {
+					state.notifications.push(message);
+				},
+			},
+		},
+	};
+}
+
+/** Mount the footer component once, as pi does; render() may then be called per frame. */
+function mountFooter(factory: (tui: unknown, theme: unknown, data: unknown) => unknown): {
+	render(width: number): string[];
+} {
+	return factory(
+		{ requestRender() {} },
+		{ fg: (_color: string, text: string) => text },
+		{
+			onBranchChange: () => () => {},
+			getGitBranch: () => "main",
+			getAvailableProviderCount: () => 2,
+			getExtensionStatuses: () => new Map(),
+		},
+	) as { render(width: number): string[] };
+}
+
+function renderFooter(factory: (tui: unknown, theme: unknown, data: unknown) => unknown, width: number): string[] {
+	return mountFooter(factory).render(width);
+}
+
+async function seedAgentDir(dir: string, mode: string, snapshot: QuotaSnapshot | undefined) {
+	await mkdir(dir, { recursive: true });
+	await writeFile(join(dir, "quota-settings.json"), JSON.stringify({ mode }), "utf8");
+	await writeFile(
+		join(dir, "quota-cache.json"),
+		JSON.stringify({ version: 2, snapshots: snapshot ? { [snapshot.kind]: snapshot } : {} }),
+		"utf8",
+	);
+}
+
+/** Sync() kicks refresh() off without awaiting it; installation lands a few ticks later. */
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate() && Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+describe("extension flow", () => {
+	let agentDir: string;
+
+	async function boot(mode: string, snapshot: QuotaSnapshot | undefined, model?: Record<string, unknown>, ctxMode = "tui") {
+		await seedAgentDir(agentDir, mode, snapshot);
+		// index.ts keeps module state; re-import fresh for each scenario.
+		const moduleUrl = new URL("../index.ts", import.meta.url).href;
+		const mod = await import(`${moduleUrl}?boot=${Date.now()}-${Math.random()}`);
+		const pi = createFakePi();
+		if (model) Object.assign(pi.ctx.model as Record<string, unknown>, model);
+		pi.ctx.mode = ctxMode;
+		mod.default(pi.api);
+		const start = pi.state.listeners.get("session_start");
+		assert.ok(start, "session_start listener registered");
+		await start({}, pi.ctx);
+		return pi;
+	}
+
+	before(async () => {
+		agentDir = await mkdtemp(join(tmpdir(), "pi-sub-quota-test-"));
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+	});
+
+	after(async () => {
+		delete process.env.PI_CODING_AGENT_DIR;
+		await rm(agentDir, { recursive: true, force: true });
+	});
+
+	it("line mode renders every window in full detail, calm or not", async () => {
+		const pi = await boot("line", zaiSnapshot(13, 77, Date.now()));
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory, "line mode must install the footer when a snapshot exists");
+		const lines = renderFooter(pi.state.footerFactory, 120);
+		assert.equal(lines.length, 3);
+		// Meters and countdowns show unconditionally — the space is there.
+		assert.match(lines[2], /^\(Max\) 5h ▓░░░░░░░░░ {2}13% (4h|3h)\d+m · 7d ▓▓▓▓▓▓▓▓░░ {2}77% (3d|2d)\d+h$/);
+	});
+
+	it("line mode keeps the same full detail while a window runs hot", async () => {
+		const pi = await boot("line", zaiSnapshot(96, 77, Date.now()));
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory);
+		const lines = renderFooter(pi.state.footerFactory, 120);
+		assert.equal(lines.length, 3);
+		assert.match(lines[2], /^\(Max\) 5h ▓▓▓▓▓▓▓▓▓▓ {2}96% (4h|3h)\d+m · 7d ▓▓▓▓▓▓▓▓░░ {2}77% (3d|2d)\d+h$/);
+	});
+
+	it("inline mode carries quiet percentages inside the provider prefix", async () => {
+		const pi = await boot("inline", zaiSnapshot(13, 77, Date.now()));
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory);
+		const lines = renderFooter(pi.state.footerFactory, 120);
+		assert.equal(lines.length, 2);
+		assert.match(lines[1], /\(zai-coding-cn 13% 77%\) glm-5\.3 • max$/);
+	});
+
+	it("leaves the built-in footer untouched without any data (no key, empty cache)", async () => {
+		const pi = await boot("inline", undefined);
+		// Give the in-flight refresh (which finds no key and no cache) time to settle.
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		assert.equal(pi.state.footerFactory, undefined, "no snapshot and no key must not touch the footer");
+	});
+
+	it("degrades silently on fetch failure: no console output, no footer, panel explains why", async () => {
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+			"utf8",
+		);
+		const errors: unknown[] = [];
+		const originalError = console.error;
+		console.error = (...args: unknown[]) => errors.push(args);
+		try {
+			// Empty cache + a stored key + an unreachable regional endpoint: the
+			// fetch fails immediately (connection refused).
+			const pi = await boot("inline", undefined, {
+				provider: "kimi-coding",
+				baseUrl: "http://127.0.0.1:1/coding/v1",
+			});
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			assert.equal(pi.state.footerFactory, undefined, "a failed fetch must not install the footer");
+			assert.equal(errors.length, 0, "fetch failures must not write to the console");
+			// /quota refresh also stays quiet and explains itself via notify.
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			await handler("refresh", pi.ctx);
+			assert.match(pi.state.notifications.at(-1) ?? "", /nothing to refresh/);
+		} finally {
+			console.error = originalError;
+			await rm(join(agentDir, "auth.json"), { force: true });
+		}
+	});
+
+	it("restores the built-in footer in off mode and via the mode command", async () => {
+		const pi = await boot("inline", zaiSnapshot(13, 77, Date.now()));
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory);
+		const handler = pi.state.command?.handler;
+		assert.ok(handler, "/quota command registered");
+		await handler("mode off", pi.ctx);
+		assert.equal(pi.state.footerFactory, undefined, "off mode must restore the built-in footer");
+		assert.deepEqual(
+			JSON.parse(await readFile(join(agentDir, "quota-settings.json"), "utf8")),
+			{ mode: "off" },
+			"the mode must be persisted, not just applied in memory",
+		);
+		await handler("mode line", pi.ctx);
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory, "switching back to line reinstalls the footer");
+	});
+
+	it("explains an expired OAuth token instead of fetching a guaranteed 401", async () => {
+		// kimi-coding logged in via OAuth, but the access token has lapsed: no
+		// fetch must be attempted, and the /quota panel must say why.
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "kimi-coding": { type: "oauth", access: "stale-token", refresh: "r", expires: Date.now() - 1 } }),
+			"utf8",
+		);
+		try {
+			const pi = await boot("inline", undefined, { provider: "kimi-coding" });
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(pi.state.footerFactory, undefined, "an expired token must not install the footer");
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			await handler("", pi.ctx);
+			assert.match(pi.state.notifications.at(-1) ?? "", /oauth token expired/);
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+		}
+	});
+
+	it("lists the /quota panel active provider first, then the rest alphabetically", async () => {
+		// Entries without usable credentials: no fetch, but the panel order shows.
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({
+				"zai-coding-cn": { type: "api_key" },
+				"kimi-coding": { type: "oauth" },
+				deepseek: { type: "api_key" },
+			}),
+			"utf8",
+		);
+		try {
+			const pi = await boot("inline", undefined); // model is zai-coding-cn → active
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			await handler("", pi.ctx);
+			const panel = pi.state.notifications.at(-1) ?? "";
+			const zai = panel.indexOf("zai-coding-cn");
+			const deepseek = panel.indexOf("deepseek");
+			const kimi = panel.indexOf("kimi-coding");
+			assert.ok(zai !== -1 && deepseek !== -1 && kimi !== -1, `all blocks present:\n${panel}`);
+			assert.ok(zai < deepseek && deepseek < kimi, `active first, rest alphabetical:\n${panel}`);
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+		}
+	});
+
+	it("restores the built-in footer when the model switches away and reinstalls it on return", async () => {
+		const pi = await boot("inline", zaiSnapshot(13, 77, Date.now()));
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory);
+		const onSelect = pi.state.listeners.get("model_select");
+		assert.ok(onSelect, "model_select listener registered");
+		await onSelect({ model: { provider: "anthropic", id: "claude-4" } }, pi.ctx);
+		assert.equal(pi.state.footerFactory, undefined, "a provider without quota must restore the built-in footer");
+		await onSelect({ model: { provider: "zai-coding-cn", id: "glm-5.3" } }, pi.ctx);
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory, "switching back reinstalls the footer");
+	});
+
+	it("keeps showing a cached snapshot with a ~ prefix while refreshes fail", async () => {
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+			"utf8",
+		);
+		try {
+			// A cache entry past its TTL plus an unreachable endpoint: the footer
+			// installs from the cache and keeps the numbers marked stale (~).
+			const pi = await boot("inline", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), {
+				provider: "kimi-coding",
+				baseUrl: "http://127.0.0.1:1/coding/v1",
+			});
+			await waitFor(() => pi.state.footerFactory !== undefined);
+			assert.ok(pi.state.footerFactory, "a cached snapshot must install the footer even when stale");
+			const lines = renderFooter(pi.state.footerFactory, 120);
+			assert.match(lines[1], /\(kimi-coding ~13% 77%\)/);
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+		}
+	});
+
+	it("reinstalls the footer after pi resets the session UI (session replacement)", async () => {
+		const pi = await boot("inline", zaiSnapshot(13, 77, Date.now()));
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		// pi clears extension UI on session invalidation (/new, /fork, /resume)
+		// without notifying extensions, and reuses this module instance after.
+		pi.state.footerFactory = undefined;
+		const start = pi.state.listeners.get("session_start");
+		assert.ok(start);
+		await start({}, pi.ctx);
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory, "session_start must be able to reinstall the footer");
+	});
+
+	it("stops the timer and restores the built-in footer on session shutdown", async () => {
+		const pi = await boot("inline", zaiSnapshot(13, 77, Date.now()));
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		const shutdown = pi.state.listeners.get("session_shutdown");
+		assert.ok(shutdown, "session_shutdown listener registered");
+		await shutdown({}, pi.ctx);
+		assert.equal(pi.state.footerFactory, undefined, "shutdown must restore the built-in footer");
+	});
+
+	it("does not install the footer for a snapshot without items", async () => {
+		const empty = zaiSnapshot(13, 77, Date.now());
+		empty.items = [];
+		const pi = await boot("inline", empty);
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		assert.equal(pi.state.footerFactory, undefined, "nothing to show must not replace the built-in footer");
+	});
+
+	it("scales line-mode meters with the terminal width", async () => {
+		const pi = await boot("line", zaiSnapshot(13, 77, Date.now()));
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory);
+		const meterCells = (width: number): number => {
+			const lines = renderFooter(pi.state.footerFactory as NonNullable<typeof pi.state.footerFactory>, width);
+			return (lines[2].match(/[▓░]/g) ?? []).length;
+		};
+		assert.equal(meterCells(120), 20, "two 10-cell meters from width 80");
+		assert.equal(meterCells(79), 12, "two 6-cell meters below 80");
+		assert.equal(meterCells(59), 8, "two 4-cell meters below 60");
+		assert.equal(meterCells(47), 0, "no meter cells below 48");
+	});
+
+	it("drops the quota from the prefix before dropping the prefix at tight widths", async () => {
+		const pi = await boot("inline", zaiSnapshot(13, 77, Date.now()));
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory);
+		const lines = renderFooter(pi.state.footerFactory, 44);
+		assert.match(lines[1], /\(zai-coding-cn\) glm-5\.3 • max$/);
+		assert.doesNotMatch(lines[1], /13%/);
+	});
+
+	it("truncates the stats segment on very narrow terminals instead of overflowing", async () => {
+		const pi = await boot("inline", zaiSnapshot(13, 77, Date.now()));
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory);
+		// A long stats segment: many usage entries make it far wider than 24 columns.
+		const entries = Array.from({ length: 20 }, () => ({
+			type: "usage",
+			usage: { input: 123456, output: 65432, cacheRead: 999999, cacheWrite: 888888, cost: { total: 1.234 } },
+		}));
+		(pi.ctx.sessionManager as { getEntries: () => unknown[] }).getEntries = () => entries;
+		for (const width of [24, 40]) {
+			const lines = renderFooter(pi.state.footerFactory, width);
+			for (const line of lines) {
+				assert.ok(visibleWidth(line) <= width, `width ${width}: line must not overflow: ${line}`);
+			}
+		}
+	});
+
+	it("reads context usage once per session state instead of on every frame", async () => {
+		const pi = await boot("inline", zaiSnapshot(13, 77, Date.now()));
+		// The footer closure captured ctx at install time, so patching the shared
+		// object's method is observed by the component.
+		let calls = 0;
+		(pi.ctx as { getContextUsage: () => undefined }).getContextUsage = () => {
+			calls++;
+			return undefined;
+		};
+		await waitFor(() => pi.state.footerFactory !== undefined);
+		assert.ok(pi.state.footerFactory);
+		const component = mountFooter(pi.state.footerFactory);
+		component.render(120);
+		component.render(120);
+		component.render(80);
+		assert.equal(calls, 1, "unchanged session state must not re-project the session");
+		// A new entry (or a model switch) is exactly what rebuilds the cache.
+		const entries: unknown[] = [];
+		(pi.ctx.sessionManager as { getEntries: () => unknown[] }).getEntries = () => entries;
+		entries.push({ type: "usage", usage: { input: 1 } });
+		component.render(120);
+		assert.equal(calls, 2);
+	});
+
+	it("does not install a footer outside TUI mode (RPC, JSON, print have none)", async () => {
+		// A fresh cache entry would install the footer in TUI mode; outside TUI
+		// there is no footer to replace, so nothing may ever be installed.
+		const pi = await boot("inline", zaiSnapshot(13, 77, Date.now()), undefined, "rpc");
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		assert.equal(pi.state.footerFactory, undefined, "non-TUI modes must never install the footer");
+	});
+
+	it("autocompletes sub-commands and modes, naming only real modes", async () => {
+		const pi = await boot("inline", undefined);
+		const completions = pi.state.command?.getArgumentCompletions?.("") ?? [];
+		const values = completions.map((completion) => completion.value);
+		assert.deepEqual(values, ["refresh", "mode", "help"]);
+		const modeCompletion = completions.find((completion) => completion.value === "mode");
+		assert.match(modeCompletion?.description ?? "", /\(line, inline, off\)/);
+		const modes = (pi.state.command?.getArgumentCompletions?.("mode ") ?? []).map((c) => c.value);
+		assert.deepEqual(modes, ["mode line", "mode inline", "mode off"]);
+	});
+});
