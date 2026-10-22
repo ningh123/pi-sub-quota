@@ -384,6 +384,31 @@ describe("formatQuotaPanel", () => {
 		);
 	});
 
+	it("appends a failure note below the numbers it explains", () => {
+		// A remembered fetch failure rides along with the last good numbers:
+		// windows first, the reason second — stale data always says why, and the
+		// note never replaces the numbers it belongs to.
+		const failing: QuotaPanelRow = {
+			label: "kimi-coding",
+			planLabel: "coding plan",
+			stale: true,
+			snapshot: {
+				kind: "kimi",
+				fetchedAt: now - 10 * 60_000,
+				items: [window("5h", 25, new Date(2026, 8, 15, 13, 47).getTime())],
+			},
+			note: "quota unavailable (HTTP 500)",
+		};
+		assert.equal(
+			formatQuotaPanel([failing], now),
+			[
+				"~kimi-coding  coding plan",
+				`  5h  ${"▓".repeat(3)}${"░".repeat(7)}   75% left   reset 13:47`,
+				"  quota unavailable (HTTP 500)",
+			].join("\n"),
+		);
+	});
+
 	it("joins several currency balances on the provider header", () => {
 		const both: QuotaPanelRow = {
 			label: "deepseek",

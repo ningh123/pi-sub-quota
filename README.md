@@ -25,7 +25,7 @@ Restart pi (or run `/reload`). There is nothing to configure: the extension reus
 | Command | Effect |
 | --- | --- |
 | `/quota` | cached quota for every configured provider, instantly — stale numbers refresh in the background and the panel updates when they land |
-| `/quota refresh` | force a re-fetch for the active provider now (at most one request per provider per minute, machine-wide) |
+| `/quota refresh` | force a re-fetch for the active provider now (at most one request per provider per minute, machine-wide, plus one immediate in-cycle retry when a request fails) |
 | `/quota mode inline\|line\|off` | how — and whether — the footer shows quota |
 | `/quota help` | list options |
 
@@ -87,7 +87,7 @@ Custom providers work without configuration too: detection falls back to the mod
 ## Good to know
 
 - Numbers refresh while you work — on model switches and on every agent run — but at most once every five minutes per provider; an idle session, mode `off`, and non-TUI sessions (RPC, JSON) send no requests at all.
-- Each provider endpoint is asked at most once per minute, machine-wide: every attempt (even a failed one) persists its timestamp in the shared cache before the request starts, so several pi sessions keep their distance too.
+- Each provider endpoint is asked at most once per minute, machine-wide: every attempt (even a failed one) persists its timestamp in the shared cache before the request starts, so several pi sessions keep their distance too. A failed request earns a single immediate retry inside its cycle; when a fetch keeps failing, the `/quota` panel says so on the provider's own line — never as an interrupting notification.
 - A failed refresh never breaks anything: the last numbers stay, marked `~`, until the next success — and `/quota` says why a provider failed (`quota unavailable (HTTP 401)`) or when it will retry (`retry in 42s`).
 - Several pi sessions on the same machine share one cache safely.
 - A lapsed Kimi OAuth token is skipped with a note — it refreshes the next time pi itself calls Kimi.

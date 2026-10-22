@@ -35,8 +35,10 @@
  * Each provider endpoint is asked at most once per minute machine-wide:
  * every attempt, successful or not, persists `lastRequests` in the cache
  * file before the request starts, so concurrent sessions and failing
- * endpoints keep their distance too. When a refresh fails, the last
- * snapshot is kept with a warning `~` prefix until a fetch succeeds again.
+ * endpoints keep their distance too (a failed request earns one immediate
+ * retry inside its cycle). When a refresh fails, the last snapshot is kept
+ * with a warning `~` prefix, and the failure itself is explained inside the
+ * /quota panel — never as an interrupting notification.
  *
  * Display modes (persisted in `<agent-dir>/quota-settings.json`):
  *   line     dedicated quota line under the stats with labeled meters and
@@ -84,6 +86,8 @@ const TICK_MS = 60_000;
 const FETCH_TIMEOUT_MS = 8000;
 /** No provider endpoint is asked more often than this, machine-wide. */
 const MIN_REQUEST_INTERVAL_MS = 60_000;
+/** Pause before the single retry a failed fetch earns inside its cycle. */
+const FETCH_RETRY_DELAY_MS = 500;
 
 /** The model fields detection needs; structurally compatible with pi's Model. */
 interface ActiveModel {
@@ -98,6 +102,19 @@ let activeProviderId: string | undefined;
 let activeBaseUrl: string | undefined;
 let currentMode: QuotaMode | undefined;
 let refreshing = false;
+/**
+ * Serializes refresh cycles end-to-end: a call that arrives while a cycle is
+ * open waits for it and then runs its own. A manual /quota refresh can then
+ * never be dropped by (or interleave with) the boot or activity refresh — it
+ * queues behind it and reports the machine-wide rate limit instead of racing.
+ */
+let refreshQueue: Promise<void> = Promise.resolve();
+/**
+ * Last fetch failure per provider, remembered for the /quota panel: it
+ * explains missing-or-stale numbers on the panel's own surface until a
+ * fetch succeeds again, instead of interrupting the user with a notification.
+ */
+const lastErrors = new Map<ProviderKind, { message: string; at: number }>();
 /** True when the shown snapshot predates a failed refresh. */
 let stale = false;
 let currentSnapshot: QuotaSnapshot | undefined;
@@ -254,8 +271,9 @@ type FetchOutcome =
  * MIN_REQUEST_INTERVAL_MS has passed since any session last attempted a
  * fetch. The attempt time is persisted before the request starts, so even
  * concurrent sessions and failing endpoints keep at least a minute between
- * requests machine-wide (a read-write race can still admit one duplicate,
- * which only costs one extra status request).
+ * attempts machine-wide. Two bounded excesses remain: a read-write race can
+ * admit one duplicate reservation, and a failed attempt earns one immediate
+ * in-cycle retry — both are extra status requests only, never data ones.
  */
 async function reserveFetchSlot(kind: ProviderKind): Promise<boolean> {
 	const now = Date.now();
@@ -282,15 +300,26 @@ async function fetchAndCache(provider: QuotaProvider, providerId: string | undef
 	const apiKey = await readAuthKey(providerId);
 	if (!apiKey) return { status: "no-credential" };
 	if (!(await reserveFetchSlot(provider.kind))) return { status: "limited" };
-	try {
-		const snapshot = await provider.fetchQuota(apiKey, { now: Date.now, timeoutMs: FETCH_TIMEOUT_MS, baseUrl });
-		await writeCacheSnapshot(snapshot);
-		return { status: "fetched", snapshot };
-	} catch (error) {
-		// Expected while offline or on provider errors: keep showing the last
-		// snapshot instead of logging — pi shows extension stderr to the user,
-		// and a dropped status fetch is not an error worth interrupting anyone for.
-		return { status: "error", message: error instanceof Error ? error.message : String(error) };
+	// One retry: quota endpoints blip (5xx, connection resets) and a single
+	// immediate re-request usually clears it. The slot this cycle reserved
+	// covers both tries, so the machine-wide interval still bounds the pair.
+	for (let attempt = 0; ; attempt++) {
+		try {
+			const snapshot = await provider.fetchQuota(apiKey, { now: Date.now, timeoutMs: FETCH_TIMEOUT_MS, baseUrl });
+			lastErrors.delete(provider.kind);
+			await writeCacheSnapshot(snapshot);
+			return { status: "fetched", snapshot };
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (attempt < 1) {
+				await new Promise((resolve) => setTimeout(resolve, FETCH_RETRY_DELAY_MS));
+				continue;
+			}
+			// Expected while offline or on provider errors: keep showing the
+			// last snapshot; the /quota panel explains the outage on its own surface.
+			lastErrors.set(provider.kind, { message, at: Date.now() });
+			return { status: "error", message };
+		}
 	}
 }
 
@@ -302,16 +331,39 @@ interface RefreshResult {
 	fetched: boolean;
 	/** True when the request was skipped: some session asked within the last minute. */
 	limited: boolean;
+	/** Set when this cycle's own fetch failed (after its retry); the panel, not a notification, shows it. */
+	error?: string;
 }
 
-async function refresh(opts: { force?: boolean } = {}): Promise<RefreshResult> {
+function refresh(opts: { force?: boolean } = {}): Promise<RefreshResult> {
+	// Capture the active provider here, not when the queued cycle starts: a
+	// model switch between the two would pair the cycle with the wrong (or no)
+	// provider, and a manual refresh must report the provider it was asked about.
 	const provider = activeProvider;
-	if (!provider || refreshing) return { snapshot: currentSnapshot, fetched: false, limited: false };
+	if (!provider) return Promise.resolve({ snapshot: currentSnapshot, fetched: false, limited: false });
+	const providerId = activeProviderId;
+	const baseUrl = activeBaseUrl;
+	const cycle = refreshQueue.then(() => runRefreshCycle(provider, providerId, baseUrl, opts));
+	// The queue itself never rejects, or one failed cycle would poison every later one.
+	refreshQueue = cycle.then(
+		() => undefined,
+		() => undefined,
+	);
+	return cycle;
+}
+
+async function runRefreshCycle(
+	provider: QuotaProvider,
+	providerId: string | undefined,
+	baseUrl: string | undefined,
+	opts: { force?: boolean },
+): Promise<RefreshResult> {
 	/** True when the model switched to another provider since this refresh started. */
 	const switchedProvider = () => provider.kind !== activeProvider?.kind;
 	refreshing = true;
 	let fetched = false;
 	let limited = false;
+	let fetchError: string | undefined;
 	/** The snapshot this cycle fetched, if any — reported even when a mid-fetch model switch keeps it out of the footer. */
 	let fetchedSnapshot: QuotaSnapshot | undefined;
 	try {
@@ -322,7 +374,7 @@ async function refresh(opts: { force?: boolean } = {}): Promise<RefreshResult> {
 				stale = false;
 				await syncFooterInstall();
 				publishSnapshot();
-				return { snapshot: currentSnapshot, fetched: false, limited: false };
+				return { snapshot: currentSnapshot, fetched: false, limited: false, error: undefined };
 			}
 			// Show the last snapshot of any age while a refresh is in flight, so the
 			// footer never waits on the network with nothing to display.
@@ -333,8 +385,9 @@ async function refresh(opts: { force?: boolean } = {}): Promise<RefreshResult> {
 				publishSnapshot();
 			}
 		}
-		const outcome = await fetchAndCache(provider, activeProviderId, activeBaseUrl);
+		const outcome = await fetchAndCache(provider, providerId, baseUrl);
 		limited = outcome.status === "limited";
+		fetchError = outcome.status === "error" ? outcome.message : undefined;
 		fetchedSnapshot = outcome.status === "fetched" ? outcome.snapshot : undefined;
 		fetched = fetchedSnapshot !== undefined;
 		let next = fetchedSnapshot;
@@ -351,6 +404,19 @@ async function refresh(opts: { force?: boolean } = {}): Promise<RefreshResult> {
 		} else if (currentSnapshot) {
 			// Keep showing the last snapshot. A failed refresh marks it stale; a
 			// rate-limited or credential-less skip only when it is past the TTL.
+			// A limited skip sent nothing, and this cycle may have waited in the
+			// queue first: another session can have fetched meanwhile, so adopt the
+			// machine-wide cache's snapshot when it is newer than memory. Memory is
+			// captured before the await — sync() can clear currentSnapshot while the
+			// file is read — and the switch is re-checked after it so an old
+			// provider's numbers never bleed into the new one's memory.
+			if (outcome.status === "limited" && !switchedProvider()) {
+				const memory = currentSnapshot;
+				if (memory) {
+					const machine = await readCacheFile().then((cache) => cache.snapshots[provider.kind]);
+					if (machine && machine.fetchedAt > memory.fetchedAt && !switchedProvider()) currentSnapshot = machine;
+				}
+			}
 			stale = outcome.status === "error" || !freshSnapshot(currentSnapshot, Date.now(), CACHE_TTL_MS);
 		}
 		await syncFooterInstall();
@@ -365,7 +431,7 @@ async function refresh(opts: { force?: boolean } = {}): Promise<RefreshResult> {
 	// Report what this call produced: the fetched snapshot even when a
 	// mid-fetch model switch kept it out of the footer (describeSnapshot
 	// names its kind), else the active provider's latest from memory.
-	return { snapshot: fetchedSnapshot ?? currentSnapshot, fetched, limited };
+	return { snapshot: fetchedSnapshot ?? currentSnapshot, fetched, limited, error: fetchError };
 }
 
 function stopTimer(): void {
@@ -487,7 +553,8 @@ function panelFetchError(message: string): string {
  * One configured provider as a panel row, rendered from cache alone: fresh
  * snapshots as-is, stale ones with their numbers kept and marked `~`,
  * missing ones as a note — "fetching…" while a refresh is in flight, the
- * failure reason or retry countdown after it failed.
+ * failure reason or retry countdown after it failed. A remembered failure
+ * rides along with the numbers it explains, so stale data always says why.
  */
 function panelRow(
 	entry: ConfiguredQuotaProvider,
@@ -506,9 +573,10 @@ function panelRow(
 		// by the pending refresh when it lands. freshSnapshot is a type guard,
 		// so the age check is inlined to keep `cached` narrowed here.
 		const fresh = now - cached.fetchedAt < CACHE_TTL_MS;
+		const failure = opts.fetchError ? `quota unavailable (${panelFetchError(opts.fetchError)})` : undefined;
 		return fresh
-			? { ...row, planLevel: cached.planLevel, snapshot: cached }
-			: { ...row, planLevel: cached.planLevel, snapshot: cached, stale: true };
+			? { ...row, planLevel: cached.planLevel, snapshot: cached, note: failure }
+			: { ...row, planLevel: cached.planLevel, snapshot: cached, stale: true, note: failure };
 	}
 	if (opts.pending) return { ...row, note: "fetching…" };
 	if (opts.fetchError) return { ...row, note: `quota unavailable (${panelFetchError(opts.fetchError)})` };
@@ -578,6 +646,18 @@ async function showQuotaPanel(ctx: ExtensionContext): Promise<void> {
 	});
 	const cache = await readCacheFile();
 	const now = Date.now();
+	// A remembered failure explains missing-or-stale numbers for its provider
+	// until fresher data lands; fetch errors belong on this panel, nowhere else.
+	const rememberedErrors = (snapshots: QuotaCacheFile["snapshots"]): Map<ProviderKind, string> => {
+		const remembered = new Map<ProviderKind, string>();
+		for (const entry of ordered) {
+			const failure = lastErrors.get(entry.provider.kind);
+			if (!failure) continue;
+			const snapshot = snapshots[entry.provider.kind];
+			if (!snapshot || snapshot.fetchedAt < failure.at) remembered.set(entry.provider.kind, failure.message);
+		}
+		return remembered;
+	};
 	// Providers needing a fetch: a stale-or-missing snapshot, a usable
 	// credential, and the machine-wide request interval elapsed. The rate
 	// limit itself lives in fetchAndCache; this only keeps the first render
@@ -588,7 +668,13 @@ async function showQuotaPanel(ctx: ExtensionContext): Promise<void> {
 			hasUsableCredential(authFile?.[entry.providerId]) &&
 			requestDue(cache.lastRequests?.[entry.provider.kind], now, MIN_REQUEST_INTERVAL_MS),
 	);
-	const first = renderPanel(ordered, authFile, cache, new Set(due.map((entry) => entry.provider.kind)), new Map());
+	const first = renderPanel(
+		ordered,
+		authFile,
+		cache,
+		new Set(due.map((entry) => entry.provider.kind)),
+		rememberedErrors(cache.snapshots),
+	);
 	ctx.ui.notify(first, "info");
 	if (due.length === 0) return;
 	const errors = new Map<ProviderKind, string>();
@@ -602,6 +688,10 @@ async function showQuotaPanel(ctx: ExtensionContext): Promise<void> {
 		}),
 	);
 	const refreshed = await readCacheFile();
+	// This pass's own errors win; remembered ones fill in every other provider.
+	for (const [kind, message] of rememberedErrors(refreshed.snapshots)) {
+		if (!errors.has(kind)) errors.set(kind, message);
+	}
 	// A fresh snapshot for the active provider also updates the footer —
 	// unless an activity refresh is mid-flight, which owns that state.
 	if (!refreshing && activeProvider) {
@@ -682,23 +772,25 @@ export default function (pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const [sub, arg] = args.trim().toLowerCase().split(/\s+/);
 			if (sub === "refresh") {
-				if (refreshing) {
-					ctx.ui.notify("Quota: a refresh is already in progress", "info");
+				// Cycles are serialized, so a manual refresh waits for any
+				// in-flight one and then runs — and reports the rate limit — itself.
+				const result = await refresh({ force: true });
+				// A failed fetch is not worth interrupting anyone: the /quota panel
+				// explains the outage on its own surface, with the numbers it has.
+				if (result.error !== undefined) {
+					await showQuotaPanel(ctx);
 					return;
 				}
-				const result = await refresh({ force: true });
-				// A rate-limited skip still explains itself below, even with
-				// nothing cached yet to describe.
-				if (!result.snapshot && !result.limited) {
+				// Without a credential there is nothing to fetch; and without data
+				// or a rate-limit skip, nothing worth reporting either.
+				if (!result.fetched && !result.limited) {
 					ctx.ui.notify("Quota: nothing to refresh", "warning");
 					return;
 				}
 				ctx.ui.notify(
 					result.fetched
 						? `Quota refreshed: ${describeSnapshot(result.snapshot)}`
-						: result.limited
-							? `Quota: requested within the last minute — ${describeSnapshot(result.snapshot)}`
-							: `Quota: refresh failed — ${describeSnapshot(result.snapshot)}`,
+						: `Quota: requested within the last minute — ${describeSnapshot(result.snapshot)}`,
 					"info",
 				);
 				return;

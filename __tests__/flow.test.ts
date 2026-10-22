@@ -139,25 +139,36 @@ async function seedAgentDir(dir: string, mode: string, snapshot: QuotaSnapshot |
  * ticks later. Fails the test when the condition never arrives, so a
  * dropped refresh surfaces here instead of as a misleading later failure.
  */
-async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
-	while (!predicate() && Date.now() < deadline) {
+	while (!(await predicate()) && Date.now() < deadline) {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
-	assert.ok(predicate(), `timed out after ${timeoutMs}ms waiting for a condition that never arrived`);
+	assert.ok(await predicate(), `timed out after ${timeoutMs}ms waiting for a condition that never arrived`);
 }
 
 /**
  * A local Kimi endpoint: /coding/v1/usages serves a weekly pool (limit 2048,
  * used 1024 → 50%), /coding/v1/me the membership tier. Responses can be
  * delayed so callers can prove something did NOT wait for the network.
- * Counted requests let tests assert the machine-wide rate limit.
+ * Counted requests let tests assert the machine-wide rate limit. The first
+ * `failUsagesRequests` /usages requests answer 500, to exercise retries and
+ * error rendering; /me never fails (providers tolerate its loss silently).
  */
-async function startKimiServer(delayMs = 0): Promise<{ baseUrl: string; requests: () => number; close: () => void }> {
+async function startKimiServer(
+	delayMs = 0,
+	failUsagesRequests = 0,
+): Promise<{ baseUrl: string; requests: () => number; close: () => void }> {
 	let requests = 0;
+	let failedUsages = 0;
 	const server = http.createServer((req, res) => {
 		requests++;
 		setTimeout(() => {
+			if (!req.url?.endsWith("/me") && failedUsages++ < failUsagesRequests) {
+				res.writeHead(500, { "content-type": "application/json" });
+				res.end("{}");
+				return;
+			}
 			const body = req.url?.endsWith("/me")
 				? { user_level_name: "moderato" }
 				: {
@@ -579,6 +590,115 @@ describe("extension flow", () => {
 		}
 	});
 
+	it("adopts another session's fresher snapshot when a queued refresh is limited", async () => {
+		// A manual refresh waiting behind the boot cycle is rate-limited and
+		// sends nothing; if another session fetched meanwhile, the machine-wide
+		// cache holds fresher numbers than this process's memory — the notice
+		// must show those, not the stale in-memory copy.
+		const server = await startKimiServer();
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+			"utf8",
+		);
+		try {
+			const pi = await boot("inline", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), {
+				provider: "kimi-coding",
+				baseUrl: server.baseUrl,
+			});
+			await waitFor(() => server.requests() >= 2); // boot cycle fetched
+			// Deterministic: the boot cycle's cache write must land before the
+			// other session's fresher snapshot is layered on top of it.
+			await waitFor(async () => (await readFile(join(agentDir, "quota-cache.json"), "utf8")).includes("moderato"));
+			// Simulate the other session's fetch: fresher numbers on disk.
+			await writeFile(
+				join(agentDir, "quota-cache.json"),
+				JSON.stringify({
+					version: 2,
+					snapshots: { kimi: kimiSnapshot(42, 77, Date.now()) },
+					lastRequests: { kimi: Date.now() },
+				}),
+				"utf8",
+			);
+			const requestsAfterBoot = server.requests();
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			await handler("refresh", pi.ctx);
+			const message = pi.state.notifications.at(-1) ?? "";
+			assert.match(message, /within the last minute/);
+			assert.match(message, /5h 42%/, "shows the other session's fresher numbers");
+			assert.equal(server.requests(), requestsAfterBoot, "no request: the shared interval holds");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("retries a transient fetch failure once and still refreshes", async () => {
+		// A single 5xx blip must not reach the user at all: the cycle retries
+		// once on its own and reports success — at the cost of exactly one
+		// extra request pair.
+		const server = await startKimiServer(0, 1);
+		try {
+			// Mode off: boot starts no background refresh, so no request is sent
+			// and no rate-limit slot burned before the manual one runs.
+			const pi = await boot("off", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), {
+				provider: "kimi-coding",
+				baseUrl: server.baseUrl,
+			});
+			await writeFile(
+				join(agentDir, "auth.json"),
+				JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+				"utf8",
+			);
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			await handler("refresh", pi.ctx);
+			assert.match(pi.state.notifications.at(-1) ?? "", /Quota refreshed/);
+			// /me + failed /usages, then the retry's /me + /usages: one blip, one retry.
+			assert.equal(server.requests(), 4);
+			assert.match(await readFile(join(agentDir, "quota-cache.json"), "utf8"), /moderato/);
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("shows a persistent fetch failure in the panel, never as a notification", async () => {
+		// When the retry fails too, the user is not interrupted: the /quota
+		// panel explains the outage on the provider's own line, and keeps
+		// explaining it on later panels until a fetch succeeds again.
+		const server = await startKimiServer(0, Number.POSITIVE_INFINITY);
+		try {
+			// Mode off: boot starts no background refresh, so the manual refresh
+			// owns the first (and retried) attempt deterministically.
+			const pi = await boot("off", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), {
+				provider: "kimi-coding",
+				baseUrl: server.baseUrl,
+			});
+			await writeFile(
+				join(agentDir, "auth.json"),
+				JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+				"utf8",
+			);
+			const handler = pi.state.command?.handler;
+			assert.ok(handler);
+			await handler("refresh", pi.ctx);
+			const messages = pi.state.notifications;
+			assert.ok(
+				messages.every((message) => !message.includes("refresh failed")),
+				"no failure notification",
+			);
+			assert.match(messages.at(-1) ?? "", /quota unavailable \(HTTP 500\)/);
+			// The panel is the /quota surface: a later bare /quota still explains.
+			await handler("", pi.ctx);
+			assert.match(pi.state.notifications.at(-1) ?? "", /quota unavailable \(HTTP 500\)/);
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
 	it("refreshes the active provider on agent activity, TTL-gated, never when fresh", async () => {
 		// Boot without a credential (no request, no rate-limit slot burned),
 		// then make the cache stale, due, and credentialed: firing agent_start
@@ -605,9 +725,9 @@ describe("extension flow", () => {
 				}),
 				"utf8",
 			);
-			// Let the boot refresh settle before firing agent_start: it had no
-			// credential and sends no request, but its `refreshing` guard would
-			// silently drop an event that arrives while it is still open.
+			// Let the boot refresh settle before firing agent_start: with cycles
+			// serialized the event would merely queue behind it, and the sleep
+			// keeps this test about agent-driven fetching, not queue ordering.
 			await new Promise((resolve) => setTimeout(resolve, 50));
 			const agentStart = pi.state.listeners.get("agent_start");
 			assert.ok(agentStart, "agent_start listener registered");

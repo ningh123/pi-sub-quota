@@ -316,11 +316,7 @@ export function formatQuotaPanel(rows: QuotaPanelRow[], now: number): string {
 				.filter(Boolean)
 				.join(" · ");
 			const lines = [`${row.stale ? "~" : ""}${row.label}  ${header}`];
-			if (row.note) {
-				lines.push(`  ${row.note}`);
-			} else if (!snapshot) {
-				lines.push("  quota unavailable");
-			} else {
+			if (snapshot) {
 				for (const window of windowItems(snapshot)) {
 					const left = 100 - window.usedPercent;
 					const reset =
@@ -333,6 +329,13 @@ export function formatQuotaPanel(rows: QuotaPanelRow[], now: number): string {
 						lines.push(`${" ".repeat(labelWidth + 4)}└ ${tools}`);
 					}
 				}
+			}
+			// A note rides along below the numbers it explains; only a row with
+			// neither snapshot nor note falls back to the bare unavailability line.
+			if (row.note) {
+				lines.push(`  ${row.note}`);
+			} else if (!snapshot) {
+				lines.push("  quota unavailable");
 			}
 			return lines.join("\n");
 		})
