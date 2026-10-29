@@ -124,9 +124,12 @@ function renderFooter(factory: (tui: unknown, theme: unknown, data: unknown) => 
 	return mountFooter(factory).render(width);
 }
 
-async function seedAgentDir(dir: string, mode: string, snapshot: QuotaSnapshot | undefined) {
+async function seedAgentDir(dir: string, mode: string, snapshot: QuotaSnapshot | undefined, seedCache = true) {
 	await mkdir(dir, { recursive: true });
 	await writeFile(join(dir, "quota-settings.json"), JSON.stringify({ mode }), "utf8");
+	// seedCache=false leaves the cache file for a simulated second session
+	// that must start from whatever an earlier session left on disk.
+	if (!seedCache) return;
 	await writeFile(
 		join(dir, "quota-cache.json"),
 		JSON.stringify({ version: 2, snapshots: snapshot ? { [snapshot.kind]: snapshot } : {} }),
@@ -191,8 +194,16 @@ async function startKimiServer(
 describe("extension flow", () => {
 	let agentDir: string;
 
-	async function boot(mode: string, snapshot: QuotaSnapshot | undefined, model?: Record<string, unknown>, ctxMode = "tui") {
-		await seedAgentDir(agentDir, mode, snapshot);
+	// keepSharedCache: leave quota-cache.json alone so a second simulated
+	// session starts from whatever the first one left on disk.
+	async function boot(
+		mode: string,
+		snapshot: QuotaSnapshot | undefined,
+		model?: Record<string, unknown>,
+		ctxMode = "tui",
+		keepSharedCache = false,
+	) {
+		await seedAgentDir(agentDir, mode, snapshot, !keepSharedCache);
 		// index.ts keeps module state; re-import fresh for each scenario.
 		const moduleUrl = new URL("../index.ts", import.meta.url).href;
 		const mod = await import(`${moduleUrl}?boot=${Date.now()}-${Math.random()}`);
@@ -805,6 +816,124 @@ describe("extension flow", () => {
 			// The fetched numbers still landed in the shared cache.
 			const cache = JSON.parse(await readFile(join(agentDir, "quota-cache.json"), "utf8"));
 			assert.equal(cache.snapshots.kimi.planLevel, "moderato");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("refreshes mid-run on completed assistant turns, ignoring non-assistant messages", async () => {
+		// A long task burns quota turn after turn; run boundaries alone would
+		// leave the footer stale for the whole run. Each completed assistant
+		// turn must re-fetch (TTL-gated), while user messages and tool results
+		// — which consume no quota — must not.
+		const server = await startKimiServer();
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+			"utf8",
+		);
+		try {
+			// Boot with a fresh snapshot: the boot cycle then takes the early
+			// fresh-return path, which provably never reaches the fetch — the
+			// footer install is that path's last act, so waiting for it settles
+			// the cycle before the cache below goes stale and due.
+			const pi = await boot("inline", kimiSnapshot(13, 77, Date.now()), {
+				provider: "kimi-coding",
+				baseUrl: server.baseUrl,
+			});
+			await waitFor(() => pi.state.footerFactory !== undefined);
+			// Re-seed: stale snapshot, last request just past the interval.
+			await writeFile(
+				join(agentDir, "quota-cache.json"),
+				JSON.stringify({
+					version: 2,
+					snapshots: { kimi: kimiSnapshot(13, 77, Date.now() - 60 * MINUTE) },
+					lastRequests: { kimi: Date.now() - 61_000 },
+				}),
+				"utf8",
+			);
+			const messageEnd = pi.state.listeners.get("message_end");
+			assert.ok(messageEnd, "message_end listener registered");
+			// Non-assistant messages consume no quota and must not fetch.
+			await messageEnd({ message: { role: "user", content: "hello" } }, pi.ctx);
+			await messageEnd({ message: { role: "toolResult", content: [], toolCallId: "t1" } }, pi.ctx);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			assert.equal(server.requests(), 0, "user and tool-result messages must not trigger a fetch");
+			// The run's first completed assistant turn does.
+			await messageEnd({ message: { role: "assistant", content: [] } }, pi.ctx);
+			await waitFor(() => server.requests() >= 2); // /usages + /me
+			// Fresh now: further turns inside the TTL must not re-fetch.
+			const afterFetch = server.requests();
+			await messageEnd({ message: { role: "assistant", content: [] } }, pi.ctx);
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(server.requests(), afterFetch, "a fresh cache must not be re-fetched mid-run");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("shares one cache between sessions: later turns adopt instead of re-fetching", async () => {
+		// Several pi sessions on one machine must not hammer a provider or
+		// fight over the cache: whichever session's turn finds the shared
+		// snapshot stale fetches once, and everyone else adopts the result.
+		const server = await startKimiServer();
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+			"utf8",
+		);
+		try {
+			const model = { provider: "kimi-coding", baseUrl: server.baseUrl };
+			const cacheText = () => readFile(join(agentDir, "quota-cache.json"), "utf8");
+			// First session boots against a stale, due cache and fetches once.
+			const first = await boot("inline", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), model);
+			await waitFor(async () => (await cacheText()).includes("moderato"));
+			assert.equal(server.requests(), 2, "exactly the first session's boot cycle: /usages + /me");
+			// Second session, same machine, sharing the cache file: its boot
+			// cycle adopts the fresh numbers and sends nothing.
+			const second = await boot("inline", undefined, model, "tui", true);
+			await waitFor(() => second.state.footerFactory !== undefined);
+			assert.equal(server.requests(), 2, "a fresh shared cache must spare the second session's boot fetch");
+			const factory = second.state.footerFactory;
+			assert.ok(factory);
+			// The first session completes a later turn (distinctive numbers on
+			// disk, reservation within the minute): the second session's own
+			// turn must adopt them without a request of its own.
+			await writeFile(
+				join(agentDir, "quota-cache.json"),
+				JSON.stringify({
+					version: 2,
+					snapshots: { kimi: kimiSnapshot(42, 77, Date.now()) },
+					lastRequests: { kimi: Date.now() },
+				}),
+				"utf8",
+			);
+			const secondTurn = second.state.listeners.get("message_end");
+			assert.ok(secondTurn, "message_end listener registered");
+			await secondTurn({ message: { role: "assistant", content: [] } }, second.ctx);
+			await waitFor(() => renderFooter(factory, 120).join("\n").includes("42%"));
+			assert.equal(server.requests(), 2, "adopting fresh shared numbers must not send a request");
+			// Stale and due again: this time the second session's turn fetches,
+			// and the first session's next turn adopts the result instead of
+			// requesting again — one fetch per interval serves them all.
+			await writeFile(
+				join(agentDir, "quota-cache.json"),
+				JSON.stringify({
+					version: 2,
+					snapshots: { kimi: kimiSnapshot(13, 77, Date.now() - 60 * MINUTE) },
+					lastRequests: { kimi: Date.now() - 61_000 },
+				}),
+				"utf8",
+			);
+			await secondTurn({ message: { role: "assistant", content: [] } }, second.ctx);
+			await waitFor(async () => (await cacheText()).includes("moderato") && server.requests() >= 4);
+			const firstTurn = first.state.listeners.get("message_end");
+			assert.ok(firstTurn);
+			await firstTurn({ message: { role: "assistant", content: [] } }, first.ctx);
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(server.requests(), 4, "the first session must adopt the second's fresh fetch");
 		} finally {
 			await rm(join(agentDir, "auth.json"), { force: true });
 			server.close();

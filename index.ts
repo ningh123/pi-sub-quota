@@ -29,9 +29,12 @@
  *     stale snapshots keep their numbers behind a `~` — then refreshes the
  *     stale ones in the background and re-renders once when data landed;
  *   - `/quota refresh` force-refreshes the active provider;
- *   - agent runs (`agent_start` / `agent_end`) and model switches refresh
- *     the active provider, TTL-gated — an idle session, mode off, and
- *     non-TUI sessions (RPC, JSON, print) send no requests at all.
+ *   - agent runs (`agent_start` / `agent_end`), every completed assistant
+ *     turn (`message_end` — a long task burns quota turn after turn, and
+ *     its boundaries alone would leave the footer stale for the whole
+ *     run), and model switches refresh the active provider, TTL-gated —
+ *     an idle session, mode off, and non-TUI sessions (RPC, JSON, print)
+ *     send no requests at all.
  * Each provider endpoint is asked at most once per minute machine-wide:
  * every attempt, successful or not, persists `lastRequests` in the cache
  * file before the request starts, so concurrent sessions and failing
@@ -530,12 +533,12 @@ async function sync(ctx: ExtensionContext, model: ActiveModel | undefined): Prom
 }
 
 /**
- * Streaming activity (agent run started or finished): the active
- * subscription's numbers may have moved with the work. Refresh in the
- * background, TTL- and rate-gated — at most one request per CACHE_TTL_MS
- * while the session is active, none while it sits idle or displays no
- * footer (mode off, non-TUI). Never awaited: the agent loop must not
- * wait on a status fetch.
+ * Streaming activity (agent run started or finished, an assistant turn
+ * completed): the active subscription's numbers may have moved with the
+ * work. Refresh in the background, TTL- and rate-gated — at most one
+ * request per CACHE_TTL_MS while the session is active, none while it
+ * sits idle or displays no footer (mode off, non-TUI). Never awaited:
+ * the agent loop must not wait on a status fetch.
  */
 function onAgentActivity(): void {
 	// Off and non-TUI sessions show nothing (the /quota panel fetches on
@@ -740,10 +743,18 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("model_select", async (event, ctx) => {
 		await sync(ctx, event.model);
 	});
-	// Run boundaries are the activity signal: refreshes ride on real work
-	// instead of a wall clock, so an idle session sends no requests at all.
+	// Run boundaries and completed assistant turns are the activity
+	// signal: refreshes ride on real work instead of a wall clock, so an
+	// idle session sends no requests at all. Mid-run turns matter because
+	// one task can burn quota for hours while its boundaries alone would
+	// leave the footer stale throughout.
 	pi.on("agent_start", onAgentActivity);
 	pi.on("agent_end", onAgentActivity);
+	pi.on("message_end", (event) => {
+		// Only assistant turns consume provider quota; user messages and
+		// tool results ride inside the same run without spending any.
+		if (event.message.role === "assistant") onAgentActivity();
+	});
 	pi.on("session_shutdown", () => {
 		// The runtime is about to be torn down (quit, /reload, session
 		// replacement): stop the tick timer so a reused module instance never
