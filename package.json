@@ -1,6 +1,6 @@
 {
   "name": "pi-sub-quota",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Coding-plan quota and prepaid balance in the pi footer, shown only while a subscription provider such as ZAI/GLM, DeepSeek, or Kimi is active",
   "keywords": [
     "pi-package",
