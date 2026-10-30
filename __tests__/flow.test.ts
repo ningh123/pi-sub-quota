@@ -52,12 +52,13 @@ function windowSnapshot(kind: "zai" | "kimi", used5h: number, used7d: number, fe
 const zaiSnapshot = (used5h: number, used7d: number, fetchedAt: number) => windowSnapshot("zai", used5h, used7d, fetchedAt);
 const kimiSnapshot = (used5h: number, used7d: number, fetchedAt: number) => windowSnapshot("kimi", used5h, used7d, fetchedAt);
 
-/** Fake pi surfaces: captures setFooter/notify and the registered command. */
+/** Fake pi surfaces: captures setFooter/notify, the registered command, and shared-bus listeners. */
 function createFakePi() {
 	const state = {
 		footerFactory: undefined as ((tui: unknown, theme: unknown, data: unknown) => unknown) | undefined,
 		notifications: [] as string[],
 		listeners: new Map<string, (event: unknown, ctx: unknown) => Promise<void> | void>(),
+		eventListeners: new Map<string, Set<(data: unknown) => void>>(),
 		command: undefined as
 			| {
 					handler: (args: string, ctx: unknown) => Promise<void>;
@@ -79,6 +80,21 @@ function createFakePi() {
 				},
 			) {
 				state.command = def;
+			},
+			events: {
+				/** pi's process-wide extension bus, as far as these tests need it. */
+				on(channel: string, handler: (data: unknown) => void) {
+					let handlers = state.eventListeners.get(channel);
+					if (!handlers) {
+						handlers = new Set();
+						state.eventListeners.set(channel, handlers);
+					}
+					handlers.add(handler);
+					return () => handlers.delete(handler);
+				},
+				emit(channel: string, data: unknown) {
+					for (const handler of state.eventListeners.get(channel) ?? []) handler(data);
+				},
 			},
 		},
 		ctx: {
@@ -752,6 +768,138 @@ describe("extension flow", () => {
 			assert.equal(server.requests(), afterFirst, "a fresh cache must not be re-fetched");
 			const cache = JSON.parse(await readFile(join(agentDir, "quota-cache.json"), "utf8"));
 			assert.equal(cache.snapshots.kimi.planLevel, "moderato");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("refreshes while a foreground subagent runs: streaming updates of its tool call", async () => {
+		// A foreground child holds the parent's turn open inside its `subagent`
+		// tool call, so the session's own activity events never fire while it
+		// burns the same account. Its streaming progress updates must drive the
+		// refresh; other tools' updates are not provider activity. One network
+		// round per module instance: the process-local rate floor.
+		const server = await startKimiServer();
+		await writeFile(join(agentDir, "auth.json"), JSON.stringify({ "kimi-coding": { type: "api_key" } }), "utf8");
+		try {
+			const pi = await boot("inline", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), {
+				provider: "kimi-coding",
+				baseUrl: server.baseUrl,
+			});
+			// Let the credential-less boot cycle settle first (it must send
+			// nothing), so a later fetch can only come from a child signal —
+			// never from a boot cycle that finds a key written mid-flight.
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.equal(server.requests(), 0, "boot without a key must not touch the network");
+			// Then make the cache stale, due, and credentialed: whatever fires
+			// next decides whether the network is touched.
+			const seedDue = () =>
+				writeFile(
+					join(agentDir, "quota-cache.json"),
+					JSON.stringify({
+						version: 2,
+						snapshots: { kimi: kimiSnapshot(13, 77, Date.now() - 60 * MINUTE) },
+						lastRequests: { kimi: Date.now() - 61_000 },
+					}),
+					"utf8",
+				);
+			await writeFile(
+				join(agentDir, "auth.json"),
+				JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+				"utf8",
+			);
+			await seedDue();
+			const toolUpdate = pi.state.listeners.get("tool_execution_update");
+			assert.ok(toolUpdate, "tool_execution_update listener registered");
+			// Other tools' streaming output is not provider activity.
+			await toolUpdate(
+				{ type: "tool_execution_update", toolName: "bash", toolCallId: "c1", args: {}, partialResult: {} },
+				pi.ctx,
+			);
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(server.requests(), 0, "a non-subagent tool update must not fetch");
+			// The parent's `subagent` tool call streams child progress.
+			await toolUpdate(
+				{ type: "tool_execution_update", toolName: "subagent", toolCallId: "c2", args: {}, partialResult: {} },
+				pi.ctx,
+			);
+			await waitFor(() => server.requests() >= 2); // /usages + /me
+			// Fresh now: a burst of child signals must be a no-op on the network.
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			const afterFetch = server.requests();
+			await toolUpdate(
+				{ type: "tool_execution_update", toolName: "subagent", toolCallId: "c2", args: {}, partialResult: {} },
+				pi.ctx,
+			);
+			pi.api.events.emit("subagent:jobs-changed", { version: 1 });
+			pi.api.events.emit("subagent:child-status", { type: "subagent.child-status", version: 1 });
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(server.requests(), afterFetch, "a fresh cache must not be re-fetched mid-run");
+		} finally {
+			await rm(join(agentDir, "auth.json"), { force: true });
+			server.close();
+		}
+	});
+
+	it("refreshes while a background subagent runs: shared-bus job events", async () => {
+		// A background child leaves the parent idle in a separate process; its
+		// progress reaches this session only through the events pi-subagents
+		// emits on pi's shared extension bus. `subagent:jobs-changed` (per
+		// activity, pi-subagents 0.83+) must drive a fetch; the sibling
+		// `subagent:child-status` subscription shares its handler one line
+		// away and is exercised in the burst below. One network round per
+		// module instance: the process-local rate floor.
+		const server = await startKimiServer();
+		await writeFile(join(agentDir, "auth.json"), JSON.stringify({ "kimi-coding": { type: "api_key" } }), "utf8");
+		try {
+			const pi = await boot("inline", kimiSnapshot(13, 77, Date.now() - 60 * MINUTE), {
+				provider: "kimi-coding",
+				baseUrl: server.baseUrl,
+			});
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.equal(server.requests(), 0, "boot without a key must not touch the network");
+			const seedDue = () =>
+				writeFile(
+					join(agentDir, "quota-cache.json"),
+					JSON.stringify({
+						version: 2,
+						snapshots: { kimi: kimiSnapshot(13, 77, Date.now() - 60 * MINUTE) },
+						lastRequests: { kimi: Date.now() - 61_000 },
+					}),
+					"utf8",
+				);
+			await writeFile(
+				join(agentDir, "auth.json"),
+				JSON.stringify({ "kimi-coding": { type: "api_key", key: "dummy-key" } }),
+				"utf8",
+			);
+			await seedDue();
+			const toolUpdate = pi.state.listeners.get("tool_execution_update");
+			assert.ok(toolUpdate, "tool_execution_update listener registered");
+			assert.ok(
+				pi.state.eventListeners.has("subagent:child-status") && pi.state.eventListeners.has("subagent:jobs-changed"),
+				"shared-bus listeners registered",
+			);
+			pi.api.events.emit("subagent:jobs-changed", { version: 1 });
+			await waitFor(() => server.requests() >= 2); // /usages + /me
+			// Fresh now: a burst of child signals must be a no-op on the network.
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			const afterFetch = server.requests();
+			pi.api.events.emit("subagent:jobs-changed", { version: 1 });
+			pi.api.events.emit("subagent:child-status", {
+				type: "subagent.child-status",
+				version: 1,
+				runId: "r1",
+				childId: "c1",
+				status: "started",
+			});
+			await toolUpdate(
+				{ type: "tool_execution_update", toolName: "subagent", toolCallId: "c3", args: {}, partialResult: {} },
+				pi.ctx,
+			);
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(server.requests(), afterFetch, "a fresh cache must not be re-fetched mid-run");
 		} finally {
 			await rm(join(agentDir, "auth.json"), { force: true });
 			server.close();

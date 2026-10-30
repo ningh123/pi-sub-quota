@@ -86,7 +86,7 @@ Custom providers work without configuration too: detection falls back to the mod
 
 ## Good to know
 
-- Numbers refresh while you work — on model switches, on every agent run, and after each assistant turn, so a long-running task keeps the footer current too — but at most once every five minutes per provider; an idle session, mode `off`, and non-TUI sessions (RPC, JSON) send no requests at all.
+- Numbers refresh while you work — on model switches, on every agent run, after each assistant turn, and throughout pi-subagents child runs (the parent session itself stays quiet while children burn the same account: a foreground child holds the turn open inside its `subagent` tool call, a background child leaves the parent idle, so child-progress events drive the refresh) — but at most once every five minutes per provider; an idle session, mode `off`, and non-TUI sessions (RPC, JSON) send no requests at all.
 - Each provider endpoint is asked at most once per minute, machine-wide: every attempt (even a failed one) persists its timestamp in the shared cache before the request starts, so several pi sessions keep their distance too. A failed request earns a single immediate retry inside its cycle; when a fetch keeps failing, the `/quota` panel says so on the provider's own line — never as an interrupting notification.
 - A failed refresh never breaks anything: the last numbers stay, marked `~`, until the next success — and `/quota` says why a provider failed (`quota unavailable (HTTP 401)`) or when it will retry (`retry in 42s`).
 - Several pi sessions on the same machine share one cache safely.

@@ -34,7 +34,15 @@
  *     its boundaries alone would leave the footer stale for the whole
  *     run), and model switches refresh the active provider, TTL-gated —
  *     an idle session, mode off, and non-TUI sessions (RPC, JSON, print)
- *     send no requests at all.
+ *     send no requests at all;
+ *   - subagent runs refresh it through the same gate, because they are the
+ *     one kind of work this session's own events never see: a foreground
+ *     pi-subagents child holds the turn open inside its `subagent` tool
+ *     call, and a background child leaves the parent idle, while both burn
+ *     the same account. Child progress arrives as `tool_execution_update`s
+ *     of the `subagent` tool call and as the `subagent:child-status` /
+ *     `subagent:jobs-changed` events pi-subagents emits on pi's shared
+ *     event bus; without pi-subagents installed those simply never fire.
  * Each provider endpoint is asked at most once per minute machine-wide:
  * every attempt, successful or not, persists `lastRequests` in the cache
  * file before the request starts, so concurrent sessions and failing
@@ -755,6 +763,22 @@ export default function (pi: ExtensionAPI): void {
 		// tool results ride inside the same run without spending any.
 		if (event.message.role === "assistant") onAgentActivity();
 	});
+	// Subagent children burn the same account while the parent session
+	// itself stays quiet: a foreground child holds the turn open inside its
+	// `subagent` tool call (no assistant turns or run boundaries until it
+	// returns), and a background child leaves the parent idle in a separate
+	// process. Neither fires the activity events above, so a long delegation
+	// would freeze the footer exactly when quota moves fastest. Route child
+	// progress — streaming updates of the parent's `subagent` tool call, and
+	// the events pi-subagents emits on pi's shared event bus — through the
+	// same gated refresh. Updates of other tools are not provider activity,
+	// and without pi-subagents the bus events simply never fire.
+	pi.on("tool_execution_update", (event) => {
+		if (event.toolName === "subagent") onAgentActivity();
+	});
+	// Optional chaining: hosts older than the shared event bus still load.
+	pi.events?.on("subagent:child-status", onAgentActivity);
+	pi.events?.on("subagent:jobs-changed", onAgentActivity);
 	pi.on("session_shutdown", () => {
 		// The runtime is about to be torn down (quit, /reload, session
 		// replacement): stop the tick timer so a reused module instance never
